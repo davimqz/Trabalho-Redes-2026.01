@@ -17,6 +17,7 @@ Projeto cliente-servidor em Python usando sockets TCP, com handshake em JSON ent
 
 - `server.py`: inicia o servidor TCP, negocia parametros da sessao e recebe payload fragmentado.
 - `client.py`: conecta ao servidor, coleta entradas, negocia sessao e envia payload com janela/ACK.
+- `run_client_server.py`: inicia servidor e cliente juntos e encerra ambos com `Ctrl + C`.
 - `instrução/Trabalho I 2026.1.pdf`: enunciado do trabalho.
 
 ## Pre-requisitos
@@ -47,12 +48,27 @@ py client.py
 - O tipo de operacao:
   - `1` ou `individual`
   - `2` ou `lotes`
-- A mensagem a ser enviada.
+- A mensagem a ser enviada (voce pode enviar varias mensagens na mesma execucao).
 
 5. Verifique no terminal do servidor e do cliente:
 - handshake concluido com `tamanho_maximo_sessao` e `janela_sessao` iguais em ambos os lados;
 - envio/recebimento de pacotes com payload de ate 4 caracteres;
 - ACK por pacote (`seq`) ate o fim da mensagem.
+
+Para encerrar:
+- no cliente, digite `sair`; ou
+- use `Ctrl + C` no terminal.
+
+### Rodar tudo em um unico terminal
+
+Para iniciar servidor e cliente juntos no mesmo terminal:
+
+```powershell
+py run_client_server.py
+```
+
+Com isso, os dois processos ficam rodando ate voce pressionar `Ctrl + C`.
+Ao interromper, o runner encerra servidor e cliente automaticamente.
 
 ### Execucao automatizada (opcional)
 

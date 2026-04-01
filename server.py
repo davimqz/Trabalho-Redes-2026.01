@@ -121,58 +121,66 @@ def main():
         server_socket.listen()
 
         print(f"[SERVIDOR] Aguardando conexões em {HOST}:{PORT}...")
+        try:
+            while True:
+                conn, addr = server_socket.accept()
+                with conn:
+                    print(f"[SERVIDOR] Conectado por {addr}")
+                    with conn.makefile('rwb') as arquivo_socket:
+                        try:
+                            client_config = receber_json(arquivo_socket)
+                        except (json.JSONDecodeError, ConnectionError) as erro:
+                            print(f'[SERVIDOR] Erro ao receber handshake: {erro}')
+                            continue
 
-        conn, addr = server_socket.accept()
-        with conn:
-            print(f"[SERVIDOR] Conectado por {addr}")
-            with conn.makefile('rwb') as arquivo_socket:
-                try:
-                    client_config = receber_json(arquivo_socket)
-                except (json.JSONDecodeError, ConnectionError) as erro:
-                    print(f'[SERVIDOR] Erro ao receber handshake: {erro}')
-                    return
+                        tipo_operacao = client_config.get('tipo_operacao', 'nao informado')
 
-                tipo_operacao = client_config.get('tipo_operacao', 'nao informado')
+                        print(f"[SERVIDOR] Handshake recebido do cliente:")
+                        print(f"  - Modo de operacao: {client_config.get('modo_operacao', 'nao informado')}")
+                        print(f"  - Tamanho maximo desejado: {client_config.get('tamanho_maximo_desejado', 'nao informado')} caracteres")
+                        print(f"  - Janela desejada: {client_config.get('janela_desejada', 'nao informado')}")
+                        print(f"  - Tipo de operacao: {tipo_operacao}")
 
-                print(f"[SERVIDOR] Handshake recebido do cliente:")
-                print(f"  - Modo de operacao: {client_config.get('modo_operacao', 'nao informado')}")
-                print(f"  - Tamanho maximo desejado: {client_config.get('tamanho_maximo_desejado', 'nao informado')} caracteres")
-                print(f"  - Janela desejada: {client_config.get('janela_desejada', 'nao informado')}")
-                print(f"  - Tipo de operacao: {tipo_operacao}")
+                        valido, mensagem_validacao = validar_handshake(client_config)
+                        if not valido:
+                            resposta_erro = {
+                                'tipo': 'handshake_ack',
+                                'status': 'erro',
+                                'mensagem': mensagem_validacao
+                            }
+                            enviar_json(arquivo_socket, resposta_erro)
+                            print(f"[SERVIDOR] Handshake rejeitado: {mensagem_validacao}")
+                            continue
 
-                valido, mensagem_validacao = validar_handshake(client_config)
-                if not valido:
-                    resposta_erro = {
-                        'tipo': 'handshake_ack',
-                        'status': 'erro',
-                        'mensagem': mensagem_validacao
-                    }
-                    enviar_json(arquivo_socket, resposta_erro)
-                    print(f"[SERVIDOR] Handshake rejeitado: {mensagem_validacao}")
-                    return
+                        tamanho_maximo_sessao = min(client_config['tamanho_maximo_desejado'], SERVER_BUFFER_SIZE)
+                        janela_sessao = min(max(client_config['janela_desejada'], MIN_JANELA), MAX_JANELA)
 
-                tamanho_maximo_sessao = min(client_config['tamanho_maximo_desejado'], SERVER_BUFFER_SIZE)
-                janela_sessao = min(max(client_config['janela_desejada'], MIN_JANELA), MAX_JANELA)
+                        server_config = {
+                            'tipo': 'handshake_ack',
+                            'status': 'ok',
+                            'modo_operacao': 'servidor',
+                            'tamanho_maximo_sessao': tamanho_maximo_sessao,
+                            'janela_sessao': janela_sessao
+                        }
+                        enviar_json(arquivo_socket, server_config)
 
-                server_config = {
-                    'tipo': 'handshake_ack',
-                    'status': 'ok',
-                    'modo_operacao': 'servidor',
-                    'tamanho_maximo_sessao': tamanho_maximo_sessao,
-                    'janela_sessao': janela_sessao
-                }
-                enviar_json(arquivo_socket, server_config)
+                        print(f"[SERVIDOR] Handshake enviado:")
+                        print(f"  - Modo de operacao: {server_config['modo_operacao']}")
+                        print(f"  - Tamanho maximo da sessao: {server_config['tamanho_maximo_sessao']} caracteres")
+                        print(f"  - Janela da sessao: {server_config['janela_sessao']}")
+                        print('[SERVIDOR] Handshake completo!')
 
-                print(f"[SERVIDOR] Handshake enviado:")
-                print(f"  - Modo de operacao: {server_config['modo_operacao']}")
-                print(f"  - Tamanho maximo da sessao: {server_config['tamanho_maximo_sessao']} caracteres")
-                print(f"  - Janela da sessao: {server_config['janela_sessao']}")
-                print('[SERVIDOR] Handshake completo!')
-
-                try:
-                    receber_payload_com_ack(arquivo_socket, tamanho_maximo_sessao)
-                except (json.JSONDecodeError, ConnectionError) as erro:
-                    print(f'[SERVIDOR] Erro durante recebimento da carga util: {erro}')
+                        while True:
+                            try:
+                                receber_payload_com_ack(arquivo_socket, tamanho_maximo_sessao)
+                            except ConnectionError:
+                                print('[SERVIDOR] Cliente encerrou a conexao.')
+                                break
+                            except json.JSONDecodeError as erro:
+                                print(f'[SERVIDOR] Erro de decodificacao JSON: {erro}')
+                                break
+        except KeyboardInterrupt:
+            print('\n[SERVIDOR] Encerrado por Ctrl + C.')
 
 if __name__ == '__main__':
     main()

@@ -129,7 +129,6 @@ def main():
     tamanho_maximo = solicitar_tamanho_maximo()
     janela_atual = solicitar_janela_atual()
     tipo_operacao = solicitar_tipo_operacao()
-    mensagem = input('[CLIENTE] Digite a mensagem para envio: ')
 
     handshake_requisicao = {
         'tipo': 'handshake',
@@ -170,8 +169,14 @@ def main():
             print(f'  - Janela da sessao: {janela_sessao}')
             print('[CLIENTE] Handshake completo!')
 
-            enviar_payload_com_janela(arquivo_socket, mensagem, tamanho_maximo_sessao, janela_sessao)
-            print('[CLIENTE] Envio da carga util concluido.')
+            while True:
+                mensagem = input("[CLIENTE] Digite a mensagem para envio (ou 'sair' para encerrar): ")
+                if mensagem.strip().lower() == 'sair':
+                    print('[CLIENTE] Encerrando cliente por solicitacao do usuario.')
+                    break
+
+                enviar_payload_com_janela(arquivo_socket, mensagem, tamanho_maximo_sessao, janela_sessao)
+                print('[CLIENTE] Envio da carga util concluido.')
 
 if __name__ == '__main__':
     main()
