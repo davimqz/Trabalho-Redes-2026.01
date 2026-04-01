@@ -27,10 +27,12 @@ def main():
             
             data = conn.recv(BUFFER_SIZE)
             client_config = json.loads(data.decode('utf-8'))
+            tipo_operacao = client_config.get('tipo_operacao', 'nao informado')
 
             print(f"[SERVIDOR] Handshake recebido do cliente:")
             print(f"  - Modo de operação: {client_config['modo_operacao']}")
             print(f"  - Tamanho máximo: {client_config['tamanho_maximo']} bytes")
+            print(f"  - Tipo de operacao: {tipo_operacao}")
 
            
             handshake_response = json.dumps(server_config).encode('utf-8')
