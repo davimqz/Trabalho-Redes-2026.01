@@ -8,14 +8,15 @@ Projeto cliente-servidor em Python usando sockets TCP, com handshake em JSON ent
 -  Envio de comunicacao em texto entre cliente e servidor.
 -  Limitacao minima de tamanho de caracteres (validacao para valor minimo de 30).
 -  A comunicacao e realizada via sockets TCP.
--  Realizacao de handshake inicial contendo modo de operacao e tamanho maximo.
+-  Realizacao de handshake inicial com negociacao bilateral de tamanho maximo e janela da sessao.
+-  Carga util fragmentada em pacotes de 4 caracteres com ACK por pacote.
 -  Relatorio sobre como a IA foi usada no projeto (secao "Uso de agentes de LLM no projeto").
 -  Manual de utilizacao documentado no README (secao "Manual de Utilizacao").
 
 ## Estrutura do projeto
 
-- `server.py`: inicia o servidor TCP e recebe o handshake do cliente.
-- `client.py`: conecta ao servidor, coleta entradas do usuario e envia o handshake.
+- `server.py`: inicia o servidor TCP, negocia parametros da sessao e recebe payload fragmentado.
+- `client.py`: conecta ao servidor, coleta entradas, negocia sessao e envia payload com janela/ACK.
 - `instrução/Trabalho I 2026.1.pdf`: enunciado do trabalho.
 
 ## Pre-requisitos
@@ -42,11 +43,16 @@ py client.py
 
 4. No cliente, informe:
 - O limite maximo de caracteres por vez (deve ser maior ou igual a 30).
+- A janela desejada (entre 1 e 5, Enter usa 5).
 - O tipo de operacao:
   - `1` ou `individual`
   - `2` ou `lotes`
+- A mensagem a ser enviada.
 
-5. Verifique no terminal do servidor e do cliente as mensagens de handshake concluido.
+5. Verifique no terminal do servidor e do cliente:
+- handshake concluido com `tamanho_maximo_sessao` e `janela_sessao` iguais em ambos os lados;
+- envio/recebimento de pacotes com payload de ate 4 caracteres;
+- ACK por pacote (`seq`) ate o fim da mensagem.
 
 ### Execucao automatizada (opcional)
 
@@ -58,15 +64,52 @@ Exemplo para enviar entradas no cliente sem digitar manualmente:
 
 Esse exemplo envia:
 - `2048` como tamanho maximo
+- janela padrao `5` (linha vazia)
 - `1` como tipo de operacao (`individual`)
+- mensagem `teste protocolo`
+
+Exemplo atualizado com todos os campos:
+
+```powershell
+"2048`n5`n1`nteste protocolo" | py client.py
+```
+
+Ordem das entradas:
+1. tamanho maximo desejado
+2. janela desejada
+3. tipo de operacao
+4. mensagem
 
 ## Detalhes tecnicos
 
 - Host: `127.0.0.1`
 - Porta: `5000`
-- Buffer no servidor: `4096`
-- Buffer no cliente: `2048`
+- Limite local do servidor para negociacao: `4096`
+- Tamanho minimo aceito para sessao: `30`
+- Janela da sessao: valor entre `1` e `5` (inicial/padrao `5`)
+- Fragmentacao da carga util: `4` caracteres por pacote
 - Comunicacao em JSON codificado em UTF-8
+
+### Protocolo resumido
+
+1. Cliente envia `handshake` com:
+- `modo_operacao`
+- `tamanho_maximo_desejado` (>= 30)
+- `janela_desejada` (1..5)
+- `tipo_operacao`
+
+2. Servidor valida e responde `handshake_ack`:
+- `status: ok` com `tamanho_maximo_sessao` e `janela_sessao`, ou
+- `status: erro` com mensagem de validacao.
+
+3. Cliente fragmenta a mensagem em blocos de 4 caracteres e envia pacotes `dados`:
+- `seq`
+- `payload`
+- `fim` (true no ultimo pacote)
+
+4. Servidor confirma cada pacote com `ack`:
+- `seq`
+- `status: ok` ou `erro`
 
 ## Problemas comuns
 
