@@ -17,7 +17,6 @@ Projeto cliente-servidor em Python usando sockets TCP, com handshake em JSON ent
 
 - `server.py`: inicia o servidor TCP, negocia parametros da sessao e recebe payload fragmentado.
 - `client.py`: conecta ao servidor, coleta entradas, negocia sessao e envia payload com janela/ACK.
-- `run_client_server.py`: inicia servidor e cliente juntos e encerra ambos com `Ctrl + C`.
 - `instrução/Trabalho I 2026.1.pdf`: enunciado do trabalho.
 
 ## Pre-requisitos
@@ -59,42 +58,33 @@ Para encerrar:
 - no cliente, digite `sair`; ou
 - use `Ctrl + C` no terminal.
 
-### Rodar tudo em um unico terminal
-
-Para iniciar servidor e cliente juntos no mesmo terminal:
-
-```powershell
-py run_client_server.py
-```
-
-Com isso, os dois processos ficam rodando ate voce pressionar `Ctrl + C`.
-Ao interromper, o runner encerra servidor e cliente automaticamente.
-
 ### Execucao automatizada (opcional)
 
 Exemplo para enviar entradas no cliente sem digitar manualmente:
 
 ```powershell
-"2048`n1" | python client.py
+"2048`n5`n1`nteste protocolo`nsair" | py client.py
 ```
 
 Esse exemplo envia:
 - `2048` como tamanho maximo
-- janela padrao `5` (linha vazia)
+- `5` como janela desejada
 - `1` como tipo de operacao (`individual`)
 - mensagem `teste protocolo`
+- comando `sair` para encerrar o loop do cliente
 
 Exemplo atualizado com todos os campos:
 
 ```powershell
-"2048`n5`n1`nteste protocolo" | py client.py
+"2048`n5`n1`nmensagem 1`nmensagem 2`nsair" | py client.py
 ```
 
 Ordem das entradas:
 1. tamanho maximo desejado
 2. janela desejada
 3. tipo de operacao
-4. mensagem
+4. mensagem (pode repetir varias vezes)
+5. `sair` para encerrar
 
 ## Detalhes tecnicos
 
