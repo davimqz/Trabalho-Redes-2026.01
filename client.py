@@ -8,6 +8,7 @@ import secrets
 import socket
 import sys
 from typing import Dict, List, Set
+import zlib
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -182,6 +183,12 @@ def fragmentar_payload(texto, tamanho_fragmento):
     return [texto[i:i + tamanho_fragmento] for i in range(0, len(texto), tamanho_fragmento)]
 
 
+def calcular_checksum(payload: str) -> str:
+    """Retorna CRC32 do payload como string hex (8 chars)."""
+    b = payload.encode('utf-8')
+    return '{:08x}'.format(zlib.crc32(b) & 0xFFFFFFFF)
+
+
 def construir_pacote(seq_atual, fragmento, fim, aesgcm=None, hmac_key=None):
     pacote = {
         'tipo': 'dados',
@@ -198,6 +205,7 @@ def construir_pacote(seq_atual, fragmento, fim, aesgcm=None, hmac_key=None):
         pacote['hmac'] = mac
     else:
         pacote['payload'] = fragmento
+        pacote['checksum'] = calcular_checksum(fragmento)
 
     return pacote
 
@@ -238,7 +246,12 @@ def enviar_pacote_controlado(
     if 'ciphertext' in pacote_envio:
         print(f"[CLIENTE] Pacote enviado seq={seq}, ciphertext(len)={len(base64.b64decode(pacote_envio['ciphertext']))}")
     else:
-        print(f"[CLIENTE] Pacote enviado seq={seq}, payload='{pacote_envio.get('payload', '')}'")
+        payload = pacote_envio.get('payload', '')
+        checksum = pacote_envio.get('checksum')
+        if checksum:
+            print(f"[CLIENTE] Pacote enviado seq={seq}, payload='{payload}', checksum={checksum}")
+        else:
+            print(f"[CLIENTE] Pacote enviado seq={seq}, payload='{payload}'")
 
 
 def normalizar_resposta_controle(resp):
@@ -407,7 +420,8 @@ def enviar_lotes_go_back_n(
                 )
 
             alvo = esperado
-            if isinstance(seq_resp, int) and esperado <= seq_resp <= fim_janela:
+            # Only accept seq_resp as new retransmit target if it lies within the current window
+            if isinstance(seq_resp, int) and base <= seq_resp <= fim_janela:
                 alvo = seq_resp
 
             print(

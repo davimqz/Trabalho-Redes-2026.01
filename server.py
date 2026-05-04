@@ -8,6 +8,7 @@ import socket
 import threading
 import sys
 from typing import Dict, Optional, Set
+import zlib
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -166,6 +167,16 @@ def validar_pacote_payload(pacote, aesgcm, hmac_key):
             return seq_raw, None, 'Falha na autenticacao do ciphertext.'
     else:
         payload = pacote.get('payload', '')
+        # checksum is required for non-encrypted packets
+        recv_checksum = pacote.get('checksum')
+        if recv_checksum is None:
+            return seq_raw, None, 'Falta checksum no pacote sem criptografia.'
+        try:
+            calc = '{:08x}'.format(zlib.crc32(payload.encode('utf-8')) & 0xFFFFFFFF)
+        except Exception:
+            return seq_raw, None, 'Erro ao calcular checksum.'
+        if calc != recv_checksum:
+            return seq_raw, None, 'Falha na verificacao de integridade (checksum).'
 
     if not isinstance(payload, str):
         return seq_raw, None, 'Payload deve ser texto.'
@@ -233,7 +244,16 @@ def receber_payload_com_ack(
                 fim_seq = seq
 
             enviar_json(arquivo_socket, {'tipo': 'ack', 'seq': seq, 'status': 'ok'})
-            print(f"[SERVIDOR] Pacote recebido seq={seq}, payload='{payload}'")
+            # Print metadata: checksum for plaintext, or nonce/hmac for ciphertext
+            meta = ''
+            if 'ciphertext' in pacote:
+                nonce_b64 = pacote.get('nonce', '')
+                hmac_val = pacote.get('hmac', '')
+                meta = f", nonce={nonce_b64[:6]}..., hmac={hmac_val[:6]}..."
+            else:
+                checksum = pacote.get('checksum')
+                meta = f", checksum={checksum}"
+            print(f"[SERVIDOR] Pacote recebido seq={seq}, payload='{payload}'{meta}")
             seq_esperado += 1
 
             if fim_seq is not None and seq_esperado > fim_seq:
@@ -252,13 +272,27 @@ def receber_payload_com_ack(
             enviar_nack(arquivo_socket, seq_esperado, f'Seq fora da janela atual. Esperado entre {seq_esperado} e {seq_esperado + janela_em_uso - 1}.')
             continue
 
+        # Proactive NACK in Selective Repeat: if we receive a later seq but missing the expected one,
+        # immediately request retransmission for seq_esperado (once).
+        if seq > seq_esperado and seq_esperado not in nacks_emitidos:
+            enviar_nack(arquivo_socket, seq_esperado, f'Sequencia faltante {seq_esperado}.')
+            nacks_emitidos.add(seq_esperado)
+
         if seq not in mensagem_partes:
             tamanho_novo = sum(len(v) for v in mensagem_partes.values()) + len(payload)
             if tamanho_novo > tamanho_maximo_sessao:
                 enviar_nack(arquivo_socket, seq, f'Mensagem total excede o limite da sessao ({tamanho_maximo_sessao}).')
                 continue
             mensagem_partes[seq] = payload
-            print(f"[SERVIDOR] Pacote recebido seq={seq}, payload='{payload}'")
+            meta = ''
+            if 'ciphertext' in pacote:
+                nonce_b64 = pacote.get('nonce', '')
+                hmac_val = pacote.get('hmac', '')
+                meta = f", nonce={nonce_b64[:6]}..., hmac={hmac_val[:6]}..."
+            else:
+                checksum = pacote.get('checksum')
+                meta = f", checksum={checksum}"
+            print(f"[SERVIDOR] Pacote recebido seq={seq}, payload='{payload}'{meta}")
 
         if fim:
             fim_seq = seq
