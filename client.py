@@ -73,10 +73,14 @@ def solicitar_tamanho_maximo():
         return tamanho
 
 
-def solicitar_janela_atual():
+def solicitar_janela_sugerida():
+    """
+    O cliente pode sugerir um tamanho de janela, mas quem decide é o servidor.
+    O valor retornado aqui é enviado como janela_desejada no handshake.
+    """
     while True:
         entrada = input(
-            f"[CLIENTE] Defina a janela atual ({MIN_JANELA}-{MAX_JANELA}, Enter para {JANELA_PADRAO}): "
+            f"[CLIENTE] Sugira um tamanho de janela ({MIN_JANELA}-{MAX_JANELA}, Enter para {JANELA_PADRAO}): "
         ).strip()
 
         if entrada == '':
@@ -261,15 +265,16 @@ def normalizar_resposta_controle(resp):
     tipo = resp.get('tipo')
     seq = resp.get('seq')
     status = resp.get('status')
+    cumulativo = resp.get('cumulativo', False)
 
     if tipo == 'ack' and status == 'ok':
-        return 'ack', seq, resp.get('mensagem', '')
+        return 'ack', seq, resp.get('mensagem', ''), cumulativo
 
     if tipo == 'nack':
-        return 'nack', seq, resp.get('mensagem', 'Solicitacao de retransmissao recebida.')
+        return 'nack', seq, resp.get('mensagem', 'Solicitacao de retransmissao recebida.'), False
 
     if tipo == 'ack' and status != 'ok':
-        return 'nack', seq, resp.get('mensagem', 'ACK de erro recebido.')
+        return 'nack', seq, resp.get('mensagem', 'ACK de erro recebido.'), False
 
     raise ValueError(f"Resposta inesperada do servidor: tipo={tipo}, status={status}")
 
@@ -311,6 +316,10 @@ def enviar_individual(
     corrupt_aplicado,
     max_retransmissoes,
 ):
+    """
+    Modo individual (Stop-and-Wait): envia um pacote e aguarda ACK/NACK.
+    Usa ACK cumulativo (mesmo que trivial com janela=1).
+    """
     for seq in sorted(pacotes.keys()):
         tentativas = 0
         while True:
@@ -325,7 +334,7 @@ def enviar_individual(
 
             try:
                 resp = receber_controle_com_timeout(arquivo_socket)
-                tipo_resp, seq_resp, msg = normalizar_resposta_controle(resp)
+                tipo_resp, seq_resp, msg, cumulativo = normalizar_resposta_controle(resp)
             except TimeoutError:
                 tentativas += 1
                 if tentativas > max_retransmissoes:
@@ -347,6 +356,15 @@ def enviar_individual(
             print(f'[CLIENTE] NACK recebido seq={seq}: {msg}. Retransmitindo ({tentativas}/{max_retransmissoes})...')
 
 
+# ---------------------------------------------------------------------------
+# Go-Back-N com ACK CUMULATIVO (Observação 2 corrigida)
+# ---------------------------------------------------------------------------
+# Semântica correta:
+#   - O servidor envia ACK(N) significando "recebi todos os pacotes até N".
+#   - O cliente avança a base da janela para N+1, confirmando N+1 pacotes
+#     de uma vez (não um a um).
+#   - Em caso de NACK(K) ou timeout, retransmite de K até o fim da janela.
+# ---------------------------------------------------------------------------
 def enviar_lotes_go_back_n(
     arquivo_socket,
     pacotes,
@@ -358,10 +376,12 @@ def enviar_lotes_go_back_n(
     max_retransmissoes,
 ):
     total = len(pacotes)
-    base = 0
+    base = 0  # próximo seq a ser confirmado
 
     while base < total:
         fim_janela = min(base + janela_sessao - 1, total - 1)
+
+        # Envia toda a janela atual de uma vez.
         reenviar_faixa(
             arquivo_socket,
             pacotes,
@@ -373,13 +393,13 @@ def enviar_lotes_go_back_n(
             corrupt_aplicado,
         )
 
-        esperado = base
         tentativas_janela = 0
 
-        while esperado <= fim_janela:
+        # Aguarda ACKs cumulativos até que toda a janela seja confirmada.
+        while base <= fim_janela:
             try:
                 resp = receber_controle_com_timeout(arquivo_socket)
-                tipo_resp, seq_resp, msg = normalizar_resposta_controle(resp)
+                tipo_resp, seq_resp, msg, cumulativo = normalizar_resposta_controle(resp)
             except TimeoutError:
                 tentativas_janela += 1
                 if tentativas_janela > max_retransmissoes:
@@ -388,12 +408,13 @@ def enviar_lotes_go_back_n(
                     )
                 print(
                     f'[CLIENTE] Timeout na janela {base}-{fim_janela}. '
-                    f'Retransmitindo (tentativa {tentativas_janela}/{max_retransmissoes})...'
+                    f'Retransmitindo a partir de {base} (tentativa {tentativas_janela}/{max_retransmissoes})...'
                 )
+                # GBN: retransmite tudo a partir da base atual.
                 reenviar_faixa(
                     arquivo_socket,
                     pacotes,
-                    esperado,
+                    base,
                     fim_janela,
                     drop_once_seqs,
                     corrupt_once_seqs,
@@ -405,30 +426,36 @@ def enviar_lotes_go_back_n(
             if seq_resp is None:
                 continue
 
-            if tipo_resp == 'ack' and seq_resp == esperado:
-                print(f'[CLIENTE] ACK recebido seq={seq_resp}')
-                esperado += 1
+            if tipo_resp == 'ack':
+                # ACK CUMULATIVO: ACK(N) confirma todos os pacotes de base até N.
+                # Avança a base para N+1 de uma vez, independentemente de quantos
+                # pacotes foram confirmados simultaneamente.
+                if seq_resp >= base:
+                    pacotes_confirmados = seq_resp - base + 1
+                    print(
+                        f'[CLIENTE] ACK cumulativo recebido seq={seq_resp} '
+                        f'(confirma {pacotes_confirmados} pacote(s): {base}..{seq_resp})'
+                    )
+                    base = seq_resp + 1
+                # ACK duplicado/atrasado: ignora.
                 continue
 
-            if tipo_resp == 'ack' and seq_resp < esperado:
-                continue
-
+            # NACK: servidor pediu reenvio a partir de seq_resp.
             tentativas_janela += 1
             if tentativas_janela > max_retransmissoes:
                 raise ValueError(
                     f'Janela {base}-{fim_janela} rejeitada apos {max_retransmissoes} retransmissoes: {msg}'
                 )
 
-            alvo = esperado
-            # Only accept seq_resp as new retransmit target if it lies within the current window
+            # GBN: retransmite a partir do seq indicado pelo NACK até o fim da janela.
+            alvo = base
             if isinstance(seq_resp, int) and base <= seq_resp <= fim_janela:
                 alvo = seq_resp
 
             print(
-                f'[CLIENTE] NACK na janela {base}-{fim_janela}, seq alvo={alvo}: {msg}. '
-                f'Retransmitindo ({tentativas_janela}/{max_retransmissoes})...'
+                f'[CLIENTE] NACK recebido seq={seq_resp}: {msg}. '
+                f'GBN: retransmitindo {alvo}..{fim_janela} ({tentativas_janela}/{max_retransmissoes})...'
             )
-            esperado = alvo
             reenviar_faixa(
                 arquivo_socket,
                 pacotes,
@@ -439,8 +466,6 @@ def enviar_lotes_go_back_n(
                 drop_aplicado,
                 corrupt_aplicado,
             )
-
-        base = fim_janela + 1
 
 
 def enviar_lotes_seletivo(
@@ -453,6 +478,11 @@ def enviar_lotes_seletivo(
     corrupt_aplicado,
     max_retransmissoes,
 ):
+    """
+    Repetição Seletiva com ACK individual.
+    Cada ACK(N) confirma apenas o pacote N específico.
+    Retransmite somente os pacotes com NACK, não a janela inteira.
+    """
     total = len(pacotes)
     base = 0
 
@@ -475,7 +505,7 @@ def enviar_lotes_seletivo(
         while pendentes:
             try:
                 resp = receber_controle_com_timeout(arquivo_socket)
-                tipo_resp, seq_resp, msg = normalizar_resposta_controle(resp)
+                tipo_resp, seq_resp, msg, cumulativo = normalizar_resposta_controle(resp)
             except TimeoutError:
                 for seq in sorted(pendentes):
                     tentativas_por_seq[seq] += 1
@@ -499,13 +529,13 @@ def enviar_lotes_seletivo(
                 continue
 
             if tipo_resp == 'ack':
+                # ACK individual: confirma apenas este seq específico.
                 if seq_resp in pendentes:
                     pendentes.remove(seq_resp)
-                    print(f'[CLIENTE] ACK recebido seq={seq_resp}')
+                    print(f'[CLIENTE] ACK individual recebido seq={seq_resp}')
                 continue
 
             if seq_resp not in pendentes:
-                # NACK atrasado/obsoleto de um seq ja confirmado.
                 continue
 
             alvo = seq_resp
@@ -515,7 +545,7 @@ def enviar_lotes_seletivo(
 
             print(
                 f'[CLIENTE] NACK recebido seq={alvo}: {msg}. '
-                f'Retransmitindo ({tentativas_por_seq[alvo]}/{max_retransmissoes})...'
+                f'SR: retransmitindo apenas seq={alvo} ({tentativas_por_seq[alvo]}/{max_retransmissoes})...'
             )
             enviar_pacote_controlado(
                 arquivo_socket,
@@ -544,6 +574,10 @@ def enviar_payload_com_janela(
     aesgcm=None,
     hmac_key=None,
 ):
+    if not mensagem:
+        print('[CLIENTE] Mensagem vazia ignorada.')
+        return
+
     if len(mensagem) > tamanho_maximo_sessao:
         raise ValueError(
             f'Mensagem com {len(mensagem)} caracteres excede o limite negociado de {tamanho_maximo_sessao}.'
@@ -621,7 +655,7 @@ def main():
 
     host, port = obter_host_port(args)
     tamanho_maximo = solicitar_tamanho_maximo()
-    janela_atual = solicitar_janela_atual()
+    janela_sugerida = solicitar_janela_sugerida()
     tipo_operacao = solicitar_tipo_operacao()
 
     handshake_requisicao = {
@@ -629,7 +663,7 @@ def main():
         'versao_protocolo': 2,
         'modo_operacao': 'cliente',
         'tamanho_maximo_desejado': tamanho_maximo,
-        'janela_desejada': janela_atual,
+        'janela_desejada': janela_sugerida,
         'tipo_operacao': tipo_operacao,
         'modo_confirmacao': args.modo_confirmacao,
         'timeout_ack_ms': args.timeout_ack_ms,
@@ -649,7 +683,7 @@ def main():
             print('[CLIENTE] Handshake enviado:')
             print(f"  - Modo de operacao: {handshake_requisicao['modo_operacao']}")
             print(f"  - Tamanho maximo desejado: {handshake_requisicao['tamanho_maximo_desejado']} caracteres")
-            print(f"  - Janela desejada: {handshake_requisicao['janela_desejada']}")
+            print(f"  - Janela sugerida ao servidor: {handshake_requisicao['janela_desejada']}")
             print(f"  - Tipo de operacao: {handshake_requisicao['tipo_operacao']}")
             print(f"  - Modo de confirmacao: {handshake_requisicao['modo_confirmacao']}")
 
@@ -668,6 +702,7 @@ def main():
 
             modo_operacao_srv = handshake_resposta.get('modo_operacao')
             tamanho_maximo_sessao = handshake_resposta.get('tamanho_maximo_sessao')
+            # A janela da sessão é DEFINIDA pelo servidor — o cliente usa este valor.
             janela_sessao = handshake_resposta.get('janela_sessao')
 
             session_salt_b64 = handshake_resposta.get('session_salt')
@@ -705,7 +740,7 @@ def main():
             print('[CLIENTE] Handshake recebido do servidor:')
             print(f"  - Modo de operacao: {handshake_resposta['modo_operacao']}")
             print(f'  - Tamanho maximo da sessao: {tamanho_maximo_sessao} caracteres')
-            print(f'  - Janela da sessao: {janela_sessao}')
+            print(f'  - Janela da sessao (definida pelo servidor): {janela_sessao}')
             print(f'  - Modo de confirmacao acordado: {modo_confirmacao}')
             print(f'  - Timeout ACK acordado: {timeout_ack_ms} ms')
             print(f'  - Max retransmissoes acordado: {max_retransmissoes}')
@@ -716,6 +751,10 @@ def main():
                 if mensagem.strip().lower() == 'sair':
                     print('[CLIENTE] Encerrando cliente por solicitacao do usuario.')
                     break
+
+                if not mensagem.strip():
+                    print('[CLIENTE] Mensagem vazia ignorada.')
+                    continue
 
                 enviar_payload_com_janela(
                     client_socket,

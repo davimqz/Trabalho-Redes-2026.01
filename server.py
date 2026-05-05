@@ -20,7 +20,9 @@ SERVER_BUFFER_SIZE = 4096
 MIN_TAMANHO = 30
 MIN_JANELA = 1
 MAX_JANELA = 5
-JANELA_INICIAL = 5
+# O servidor é quem determina o tamanho inicial da janela (requisito do enunciado).
+# O cliente pode sugerir um valor via janela_desejada, mas a decisão final é do servidor.
+JANELA_INICIAL_SERVIDOR = 5
 PAYLOAD_CHUNK_SIZE = 4
 HANDSHAKE_TIMEOUT = 10
 DEFAULT_MODO_CONFIRMACAO = 'go_back_n'
@@ -28,6 +30,7 @@ DEFAULT_TIMEOUT_ACK_MS = 5000
 DEFAULT_MAX_RETRANSMISSOES = 3
 ACCEPTED_MODO_OPERACAO = 'cliente'
 PSK = os.environ.get('PSK', 'dev_psk_for_testing_only_please_change').encode()
+# AVISO: substitua a PSK acima pela variável de ambiente PSK em produção.
 
 
 def enviar_json(arquivo_socket, mensagem):
@@ -51,6 +54,12 @@ def parse_args():
         choices=['go_back_n', 'seletivo'],
         default=DEFAULT_MODO_CONFIRMACAO,
         help='Modo aplicado quando o cliente nao informar modo_confirmacao.',
+    )
+    parser.add_argument(
+        '--janela-inicial',
+        type=int,
+        default=JANELA_INICIAL_SERVIDOR,
+        help=f'Janela inicial definida pelo servidor ({MIN_JANELA}-{MAX_JANELA}, padrao {JANELA_INICIAL_SERVIDOR}).',
     )
     return parser.parse_args()
 
@@ -95,7 +104,7 @@ def validar_handshake(cliente_handshake, modo_confirmacao_padrao):
         return False, f"Campo modo_operacao invalido. Esperado '{ACCEPTED_MODO_OPERACAO}'."
 
     tamanho_desejado = cliente_handshake.get('tamanho_maximo_desejado')
-    janela_desejada = cliente_handshake.get('janela_desejada', JANELA_INICIAL)
+    janela_desejada = cliente_handshake.get('janela_desejada', JANELA_INICIAL_SERVIDOR)
     tipo_operacao = cliente_handshake.get('tipo_operacao', 'lotes')
     modo_confirmacao = cliente_handshake.get('modo_confirmacao', modo_confirmacao_padrao)
     timeout_ack_ms = cliente_handshake.get('timeout_ack_ms', DEFAULT_TIMEOUT_ACK_MS)
@@ -167,7 +176,6 @@ def validar_pacote_payload(pacote, aesgcm, hmac_key):
             return seq_raw, None, 'Falha na autenticacao do ciphertext.'
     else:
         payload = pacote.get('payload', '')
-        # checksum is required for non-encrypted packets
         recv_checksum = pacote.get('checksum')
         if recv_checksum is None:
             return seq_raw, None, 'Falta checksum no pacote sem criptografia.'
@@ -198,16 +206,106 @@ def enviar_nack(arquivo_socket, seq, mensagem):
     )
 
 
-def receber_payload_com_ack(
+def _log_pacote_recebido(seq, payload, pacote):
+    """Imprime log de pacote recebido com metadados de integridade."""
+    if 'ciphertext' in pacote:
+        nonce_b64 = pacote.get('nonce', '')
+        hmac_val = pacote.get('hmac', '')
+        meta = f", nonce={nonce_b64[:6]}..., hmac={hmac_val[:6]}..."
+    else:
+        checksum = pacote.get('checksum')
+        meta = f", checksum={checksum}"
+    print(f"[SERVIDOR] Pacote recebido seq={seq}, payload='{payload}'{meta}")
+
+
+# ---------------------------------------------------------------------------
+# Go-Back-N com ACK CUMULATIVO
+# ---------------------------------------------------------------------------
+# Semântica correta do GBN:
+#   - O receptor aceita apenas pacotes em ordem (seq == seq_esperado).
+#   - Ao receber seq correto, envia ACK cumulativo: ACK(N) significa
+#     "recebi todos os pacotes até N inclusive — próximo esperado é N+1".
+#   - Pacotes fora de ordem são descartados (NACK de seq_esperado).
+#   - O remetente interpreta ACK(N) avançando sua base para N+1,
+#     confirmando todos os pacotes da janela até N de uma vez.
+# ---------------------------------------------------------------------------
+def receber_gbn(
     arquivo_socket,
     tamanho_maximo_sessao,
     janela_sessao,
-    tipo_operacao,
-    modo_confirmacao,
     aesgcm=None,
     hmac_key=None,
 ):
-    janela_em_uso = 1 if tipo_operacao == 'individual' else janela_sessao
+    mensagem_partes: Dict[int, str] = {}
+    fim_seq: Optional[int] = None
+    seq_esperado = 0
+
+    while True:
+        pacote = receber_json(arquivo_socket)
+        seq, payload, erro = validar_pacote_payload(pacote, aesgcm, hmac_key)
+
+        if erro:
+            # Pacote inválido: NACK pedindo reenvio do seq esperado.
+            enviar_nack(arquivo_socket, seq_esperado, erro)
+            continue
+
+        fim = bool(pacote.get('fim', False))
+
+        if seq != seq_esperado:
+            # GBN: descarta pacote fora de ordem, pede reenvio a partir de seq_esperado.
+            enviar_nack(
+                arquivo_socket,
+                seq_esperado,
+                f'Sequencia inesperada. Esperado {seq_esperado}, recebido {seq}.',
+            )
+            continue
+
+        tamanho_novo = sum(len(v) for v in mensagem_partes.values()) + len(payload)
+        if tamanho_novo > tamanho_maximo_sessao:
+            enviar_nack(arquivo_socket, seq, f'Mensagem total excede o limite da sessao ({tamanho_maximo_sessao}).')
+            continue
+
+        mensagem_partes[seq] = payload
+        _log_pacote_recebido(seq, payload, pacote)
+
+        if fim:
+            fim_seq = seq
+
+        # ACK CUMULATIVO: ACK(seq) confirma todos os pacotes de 0 até seq inclusive.
+        # O campo 'cumulativo': True deixa explícito ao cliente que este é um ACK
+        # cumulativo (ao contrário do ACK individual do modo seletivo).
+        enviar_json(arquivo_socket, {
+            'tipo': 'ack',
+            'seq': seq,
+            'status': 'ok',
+            'cumulativo': True,
+        })
+        print(f'[SERVIDOR] ACK cumulativo enviado seq={seq} (confirma 0..{seq})')
+        seq_esperado += 1
+
+        if fim_seq is not None and seq_esperado > fim_seq:
+            mensagem_final = ''.join(mensagem_partes[i] for i in range(fim_seq + 1))
+            print('[SERVIDOR] Recebimento da carga util concluido.')
+            print(f"[SERVIDOR] Mensagem reconstruida: '{mensagem_final}'")
+            return
+
+
+# ---------------------------------------------------------------------------
+# Repetição Seletiva com ACK individual
+# ---------------------------------------------------------------------------
+# Semântica correta do SR:
+#   - O receptor aceita pacotes fora de ordem dentro da janela atual.
+#   - Cada pacote recebido com sucesso recebe ACK individual imediato.
+#   - Pacotes faltantes dentro da janela recebem NACK específico.
+#   - O remetente retransmite apenas os pacotes com NACK (não a janela toda).
+# ---------------------------------------------------------------------------
+def receber_seletivo(
+    arquivo_socket,
+    tamanho_maximo_sessao,
+    janela_sessao,
+    aesgcm=None,
+    hmac_key=None,
+):
     mensagem_partes: Dict[int, str] = {}
     fim_seq: Optional[int] = None
     seq_esperado = 0
@@ -215,65 +313,29 @@ def receber_payload_com_ack(
 
     while True:
         pacote = receber_json(arquivo_socket)
-
         seq, payload, erro = validar_pacote_payload(pacote, aesgcm, hmac_key)
+
         if erro:
             enviar_nack(arquivo_socket, seq if seq is not None else -1, erro)
-            if modo_confirmacao == 'go_back_n':
-                continue
             continue
 
         fim = bool(pacote.get('fim', False))
 
-        if modo_confirmacao == 'go_back_n':
-            if seq != seq_esperado:
-                enviar_nack(
-                    arquivo_socket,
-                    seq_esperado,
-                    f'Sequencia inesperada. Esperado {seq_esperado}, recebido {seq}.',
-                )
-                continue
-
-            tamanho_novo = sum(len(v) for v in mensagem_partes.values()) + len(payload)
-            if tamanho_novo > tamanho_maximo_sessao:
-                enviar_nack(arquivo_socket, seq, f'Mensagem total excede o limite da sessao ({tamanho_maximo_sessao}).')
-                continue
-
-            mensagem_partes[seq] = payload
-            if fim:
-                fim_seq = seq
-
-            enviar_json(arquivo_socket, {'tipo': 'ack', 'seq': seq, 'status': 'ok'})
-            # Print metadata: checksum for plaintext, or nonce/hmac for ciphertext
-            meta = ''
-            if 'ciphertext' in pacote:
-                nonce_b64 = pacote.get('nonce', '')
-                hmac_val = pacote.get('hmac', '')
-                meta = f", nonce={nonce_b64[:6]}..., hmac={hmac_val[:6]}..."
-            else:
-                checksum = pacote.get('checksum')
-                meta = f", checksum={checksum}"
-            print(f"[SERVIDOR] Pacote recebido seq={seq}, payload='{payload}'{meta}")
-            seq_esperado += 1
-
-            if fim_seq is not None and seq_esperado > fim_seq:
-                mensagem_final = ''.join(mensagem_partes[i] for i in range(fim_seq + 1))
-                print('[SERVIDOR] Recebimento da carga util concluido.')
-                print(f"[SERVIDOR] Mensagem reconstruida: '{mensagem_final}'")
-                return
-
-            continue
-
+        # Pacote já confirmado anteriormente: reenvia ACK individual.
         if seq < seq_esperado:
-            enviar_json(arquivo_socket, {'tipo': 'ack', 'seq': seq, 'status': 'ok'})
+            enviar_json(arquivo_socket, {'tipo': 'ack', 'seq': seq, 'status': 'ok', 'cumulativo': False})
             continue
 
-        if seq > seq_esperado + janela_em_uso - 1:
-            enviar_nack(arquivo_socket, seq_esperado, f'Seq fora da janela atual. Esperado entre {seq_esperado} e {seq_esperado + janela_em_uso - 1}.')
+        # Pacote além da janela atual: descarta e pede reenvio do esperado.
+        if seq > seq_esperado + janela_sessao - 1:
+            enviar_nack(
+                arquivo_socket,
+                seq_esperado,
+                f'Seq fora da janela atual. Esperado entre {seq_esperado} e {seq_esperado + janela_sessao - 1}.',
+            )
             continue
 
-        # Proactive NACK in Selective Repeat: if we receive a later seq but missing the expected one,
-        # immediately request retransmission for seq_esperado (once).
+        # Pacote dentro da janela mas adiantado: NACK proativo para o seq faltante.
         if seq > seq_esperado and seq_esperado not in nacks_emitidos:
             enviar_nack(arquivo_socket, seq_esperado, f'Sequencia faltante {seq_esperado}.')
             nacks_emitidos.add(seq_esperado)
@@ -284,20 +346,14 @@ def receber_payload_com_ack(
                 enviar_nack(arquivo_socket, seq, f'Mensagem total excede o limite da sessao ({tamanho_maximo_sessao}).')
                 continue
             mensagem_partes[seq] = payload
-            meta = ''
-            if 'ciphertext' in pacote:
-                nonce_b64 = pacote.get('nonce', '')
-                hmac_val = pacote.get('hmac', '')
-                meta = f", nonce={nonce_b64[:6]}..., hmac={hmac_val[:6]}..."
-            else:
-                checksum = pacote.get('checksum')
-                meta = f", checksum={checksum}"
-            print(f"[SERVIDOR] Pacote recebido seq={seq}, payload='{payload}'{meta}")
+            _log_pacote_recebido(seq, payload, pacote)
 
         if fim:
             fim_seq = seq
 
-        enviar_json(arquivo_socket, {'tipo': 'ack', 'seq': seq, 'status': 'ok'})
+        # ACK individual: confirma apenas este seq específico.
+        enviar_json(arquivo_socket, {'tipo': 'ack', 'seq': seq, 'status': 'ok', 'cumulativo': False})
+        print(f'[SERVIDOR] ACK individual enviado seq={seq}')
 
         seq_esperado_anterior = seq_esperado
         while seq_esperado in mensagem_partes:
@@ -317,9 +373,41 @@ def receber_payload_com_ack(
             nacks_emitidos.add(seq_esperado)
 
 
+def receber_payload_com_ack(
+    arquivo_socket,
+    tamanho_maximo_sessao,
+    janela_sessao,
+    tipo_operacao,
+    modo_confirmacao,
+    aesgcm=None,
+    hmac_key=None,
+):
+    # Modo individual é um caso especial de GBN com janela=1:
+    # sempre em ordem, sem buffer fora de ordem, ACK cumulativo trivial.
+    if tipo_operacao == 'individual' or modo_confirmacao == 'go_back_n':
+        receber_gbn(
+            arquivo_socket,
+            tamanho_maximo_sessao,
+            janela_sessao if tipo_operacao != 'individual' else 1,
+            aesgcm=aesgcm,
+            hmac_key=hmac_key,
+        )
+    else:
+        receber_seletivo(
+            arquivo_socket,
+            tamanho_maximo_sessao,
+            janela_sessao,
+            aesgcm=aesgcm,
+            hmac_key=hmac_key,
+        )
+
+
 def main():
     args = parse_args()
     host, port = obter_host_port(args)
+
+    # Valida e normaliza a janela inicial configurada no servidor.
+    janela_inicial = max(MIN_JANELA, min(MAX_JANELA, args.janela_inicial))
 
     def handle_client(conn, addr):
         try:
@@ -335,11 +423,7 @@ def main():
                         try:
                             enviar_json(
                                 arquivo_socket,
-                                {
-                                    'tipo': 'handshake_ack',
-                                    'status': 'erro',
-                                    'mensagem': 'Timeout aguardando handshake.',
-                                },
+                                {'tipo': 'handshake_ack', 'status': 'erro', 'mensagem': 'Timeout aguardando handshake.'},
                             )
                         except Exception:
                             pass
@@ -349,11 +433,7 @@ def main():
                         try:
                             enviar_json(
                                 arquivo_socket,
-                                {
-                                    'tipo': 'handshake_ack',
-                                    'status': 'erro',
-                                    'mensagem': 'Handshake invalido ou conexao fechada.',
-                                },
+                                {'tipo': 'handshake_ack', 'status': 'erro', 'mensagem': 'Handshake invalido ou conexao fechada.'},
                             )
                         except Exception:
                             pass
@@ -364,21 +444,14 @@ def main():
 
                     print('[SERVIDOR] Handshake recebido do cliente:')
                     print(f"  - Modo de operacao: {client_config.get('modo_operacao', 'nao informado')}")
-                    print(
-                        f"  - Tamanho maximo desejado: {client_config.get('tamanho_maximo_desejado', 'nao informado')} caracteres"
-                    )
-                    print(f"  - Janela desejada: {client_config.get('janela_desejada', 'nao informado')}")
+                    print(f"  - Tamanho maximo desejado: {client_config.get('tamanho_maximo_desejado', 'nao informado')} caracteres")
+                    print(f"  - Janela desejada pelo cliente: {client_config.get('janela_desejada', 'nao informado')}")
                     print(f'  - Tipo de operacao: {tipo_operacao}')
                     print(f'  - Modo de confirmacao: {modo_confirmacao_cliente}')
 
                     valido, mensagem_validacao = validar_handshake(client_config, args.modo_confirmacao_padrao)
                     if not valido:
-                        resposta_erro = {
-                            'tipo': 'handshake_ack',
-                            'status': 'erro',
-                            'mensagem': mensagem_validacao,
-                        }
-                        enviar_json(arquivo_socket, resposta_erro)
+                        enviar_json(arquivo_socket, {'tipo': 'handshake_ack', 'status': 'erro', 'mensagem': mensagem_validacao})
                         print(f'[SERVIDOR] Handshake rejeitado: {mensagem_validacao}')
                         return
 
@@ -395,7 +468,18 @@ def main():
                         pass
 
                     tamanho_maximo_sessao = min(client_config['tamanho_maximo_desejado'], SERVER_BUFFER_SIZE)
-                    janela_sessao = min(max(client_config['janela_desejada'], MIN_JANELA), MAX_JANELA)
+
+                    # ----------------------------------------------------------
+                    # JANELA CONTROLADA PELO SERVIDOR (Observação 1 corrigida)
+                    # O servidor determina o tamanho da janela da sessão.
+                    # Usa seu valor inicial configurado (padrão 5), respeitando
+                    # os limites globais. O cliente pode sugerir via janela_desejada,
+                    # mas a decisão final é sempre do servidor.
+                    # Para futuras extensões, este valor pode ser ajustado
+                    # dinamicamente pelo servidor durante a sessão.
+                    # ----------------------------------------------------------
+                    janela_sessao = janela_inicial
+                    print(f'[SERVIDOR] Janela da sessao definida pelo servidor: {janela_sessao} (cliente sugeriu: {client_config.get("janela_desejada", "?")})')
 
                     server_config = {
                         'tipo': 'handshake_ack',
@@ -413,7 +497,7 @@ def main():
                     print('[SERVIDOR] Handshake enviado:')
                     print(f"  - Modo de operacao: {server_config['modo_operacao']}")
                     print(f"  - Tamanho maximo da sessao: {server_config['tamanho_maximo_sessao']} caracteres")
-                    print(f"  - Janela da sessao: {server_config['janela_sessao']}")
+                    print(f"  - Janela da sessao (definida pelo servidor): {server_config['janela_sessao']}")
                     print(f"  - Modo de confirmacao acordado: {server_config['modo_confirmacao_acordado']}")
                     print('[SERVIDOR] Handshake completo!')
 
@@ -446,6 +530,7 @@ def main():
         server_socket.listen()
 
         print(f'[SERVIDOR] Aguardando conexoes em {host}:{port}...')
+        print(f'[SERVIDOR] Janela inicial configurada: {janela_inicial}')
         try:
             while True:
                 conn, addr = server_socket.accept()
