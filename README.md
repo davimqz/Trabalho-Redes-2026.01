@@ -8,7 +8,7 @@ Projeto cliente-servidor em Python usando sockets TCP, com handshake em JSON ent
 -  Envio de comunicacao em texto entre cliente e servidor.
 -  Limitacao minima de tamanho de caracteres (validacao para valor minimo de 30).
 -  A comunicacao e realizada via sockets TCP.
--  Realizacao de handshake inicial com negociacao bilateral de tamanho maximo e janela da sessao.
+-  Realizacao de handshake inicial com negociacao bilateral de tamanho maximo e janela da sessao (sugestao do cliente, decisao final do servidor).
 -  Carga util fragmentada em pacotes de 4 caracteres com ACK por pacote.
 -  Relatorio sobre como a IA foi usada no projeto (secao "Uso de agentes de LLM no projeto").
 -  Manual de utilizacao documentado no README (secao "Manual de Utilizacao").
@@ -56,7 +56,7 @@ py client.py --host 127.0.0.1 --port 5000
 
 5. No cliente, informe:
 - O limite maximo de caracteres por vez (deve ser maior ou igual a 30).
-- A janela desejada (entre 1 e 5, Enter usa 5).
+- A janela desejada (entre 1 e 5, Enter usa 5; o servidor decide o valor final).
 - O tipo de operacao:
   - `1` ou `individual`
   - `2` ou `lotes`
