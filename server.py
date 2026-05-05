@@ -29,8 +29,23 @@ DEFAULT_MODO_CONFIRMACAO = 'go_back_n'
 DEFAULT_TIMEOUT_ACK_MS = 5000
 DEFAULT_MAX_RETRANSMISSOES = 3
 ACCEPTED_MODO_OPERACAO = 'cliente'
-PSK = os.environ.get('PSK', 'dev_psk_for_testing_only_please_change').encode()
-# AVISO: substitua a PSK acima pela variável de ambiente PSK em produção.
+
+# ---------------------------------------------------------------------------
+# SEGURANÇA: A PSK DEVE ser definida via variável de ambiente PSK em produção.
+# O valor abaixo é APENAS para desenvolvimento/testes locais e NUNCA deve
+# ser usado em ambientes reais. Defina: export PSK='sua_chave_secreta_aqui'
+# ---------------------------------------------------------------------------
+_PSK_ENV = os.environ.get('PSK', '')
+if not _PSK_ENV:
+    import warnings
+    warnings.warn(
+        "[SEGURANÇA] Variável de ambiente PSK não definida. "
+        "Usando chave de desenvolvimento insegura. "
+        "Defina PSK via variável de ambiente antes de usar em produção.",
+        stacklevel=1,
+    )
+    _PSK_ENV = 'dev_psk_for_testing_only_please_change'
+PSK = _PSK_ENV.encode()
 
 
 def enviar_json(arquivo_socket, mensagem):
@@ -95,9 +110,20 @@ def obter_host_port(args):
     return host, port
 
 
+VERSAO_PROTOCOLO_SUPORTADA = 2
+
+
 def validar_handshake(cliente_handshake, modo_confirmacao_padrao):
     if cliente_handshake.get('tipo') != 'handshake':
         return False, 'Mensagem inicial nao e um handshake valido.'
+
+    # Validação de versão: rejeita clientes com versão incompatível.
+    versao = cliente_handshake.get('versao_protocolo')
+    if versao != VERSAO_PROTOCOLO_SUPORTADA:
+        return False, (
+            f"Versao de protocolo incompativel: recebido {versao!r}, "
+            f"esperado {VERSAO_PROTOCOLO_SUPORTADA}."
+        )
 
     modo_operacao = cliente_handshake.get('modo_operacao')
     if modo_operacao != ACCEPTED_MODO_OPERACAO:
@@ -206,6 +232,25 @@ def enviar_nack(arquivo_socket, seq, mensagem):
     )
 
 
+def enviar_mensagem_encerramento_servidor(arquivo_socket, addr):
+    """
+    Envia ao cliente uma notificação de que o servidor está encerrando
+    a conexão por timeout, permitindo que o cliente não fique bloqueado.
+    """
+    try:
+        enviar_json(
+            arquivo_socket,
+            {
+                'tipo': 'encerramento',
+                'status': 'timeout',
+                'mensagem': 'Servidor encerrando conexao por inatividade.',
+            },
+        )
+        print(f'[SERVIDOR] Notificacao de encerramento enviada a {addr}.')
+    except Exception as e:
+        print(f'[SERVIDOR] Nao foi possivel notificar {addr} do encerramento: {e}')
+
+
 def _log_pacote_recebido(seq, payload, pacote):
     """Imprime log de pacote recebido com metadados de integridade."""
     if 'ciphertext' in pacote:
@@ -226,8 +271,7 @@ def _log_pacote_recebido(seq, payload, pacote):
 #   - Ao receber seq correto, envia ACK cumulativo: ACK(N) significa
 #     "recebi todos os pacotes até N inclusive — próximo esperado é N+1".
 #   - Pacotes fora de ordem são descartados (NACK de seq_esperado).
-#   - O remetente interpreta ACK(N) avançando sua base para N+1,
-#     confirmando todos os pacotes da janela até N de uma vez.
+#   - CORREÇÃO: mensagem de tipo 'fim_sessao' é tratada graciosamente.
 # ---------------------------------------------------------------------------
 def receber_gbn(
     arquivo_socket,
@@ -242,6 +286,12 @@ def receber_gbn(
 
     while True:
         pacote = receber_json(arquivo_socket)
+
+        # CORREÇÃO: trata encerramento gracioso enviado pelo cliente.
+        if isinstance(pacote, dict) and pacote.get('tipo') == 'fim_sessao':
+            print(f"[SERVIDOR] Encerramento gracioso recebido: {pacote.get('mensagem', '')}")
+            raise ConnectionError('Cliente encerrou a sessao normalmente.')
+
         seq, payload, erro = validar_pacote_payload(pacote, aesgcm, hmac_key)
 
         if erro:
@@ -272,8 +322,6 @@ def receber_gbn(
             fim_seq = seq
 
         # ACK CUMULATIVO: ACK(seq) confirma todos os pacotes de 0 até seq inclusive.
-        # O campo 'cumulativo': True deixa explícito ao cliente que este é um ACK
-        # cumulativo (ao contrário do ACK individual do modo seletivo).
         enviar_json(arquivo_socket, {
             'tipo': 'ack',
             'seq': seq,
@@ -296,7 +344,10 @@ def receber_gbn(
 # Semântica correta do SR:
 #   - O receptor aceita pacotes fora de ordem dentro da janela atual.
 #   - Cada pacote recebido com sucesso recebe ACK individual imediato.
-#   - Pacotes faltantes dentro da janela recebem NACK específico.
+#   - NACK só é enviado quando há evidência real de lacuna, isto é, quando
+#     chega um pacote com seq maior que seq_esperado.
+#   - O servidor NÃO envia NACK preventivo para o próximo seq após cada ACK,
+#     pois isso gera NACKs indevidos em transmissões sem erro/perda.
 #   - O remetente retransmite apenas os pacotes com NACK (não a janela toda).
 # ---------------------------------------------------------------------------
 def receber_seletivo(
@@ -313,6 +364,12 @@ def receber_seletivo(
 
     while True:
         pacote = receber_json(arquivo_socket)
+
+        # CORREÇÃO: trata encerramento gracioso enviado pelo cliente.
+        if isinstance(pacote, dict) and pacote.get('tipo') == 'fim_sessao':
+            print(f"[SERVIDOR] Encerramento gracioso recebido: {pacote.get('mensagem', '')}")
+            raise ConnectionError('Cliente encerrou a sessao normalmente.')
+
         seq, payload, erro = validar_pacote_payload(pacote, aesgcm, hmac_key)
 
         if erro:
@@ -335,10 +392,15 @@ def receber_seletivo(
             )
             continue
 
-        # Pacote dentro da janela mas adiantado: NACK proativo para o seq faltante.
-        if seq > seq_esperado and seq_esperado not in nacks_emitidos:
-            enviar_nack(arquivo_socket, seq_esperado, f'Sequencia faltante {seq_esperado}.')
-            nacks_emitidos.add(seq_esperado)
+        # NACK somente quando existe evidência de lacuna:
+        # se chegou seq maior que o esperado, algum pacote anterior dentro
+        # da janela realmente está faltando. Em fluxo normal 0,1,2,3...,
+        # esta condição nunca ocorre, portanto não há NACK indevido.
+        if seq > seq_esperado:
+            for faltante in range(seq_esperado, seq):
+                if faltante not in mensagem_partes and faltante not in nacks_emitidos:
+                    enviar_nack(arquivo_socket, faltante, f'Sequencia faltante {faltante}.')
+                    nacks_emitidos.add(faltante)
 
         if seq not in mensagem_partes:
             tamanho_novo = sum(len(v) for v in mensagem_partes.values()) + len(payload)
@@ -347,9 +409,12 @@ def receber_seletivo(
                 continue
             mensagem_partes[seq] = payload
             _log_pacote_recebido(seq, payload, pacote)
-
-        if fim:
-            fim_seq = seq
+            # BUG CORRIGIDO: fim_seq só é definido quando o pacote é armazenado
+            # pela primeira vez. Colocá-lo fora deste bloco permitia que uma
+            # retransmissão (seq já em mensagem_partes) sobrescrevesse fim_seq,
+            # podendo reativar uma condição de término já processada.
+            if fim and fim_seq is None:
+                fim_seq = seq
 
         # ACK individual: confirma apenas este seq específico.
         enviar_json(arquivo_socket, {'tipo': 'ack', 'seq': seq, 'status': 'ok', 'cumulativo': False})
@@ -360,6 +425,7 @@ def receber_seletivo(
             seq_esperado += 1
 
         if seq_esperado > seq_esperado_anterior:
+            # Remove NACKs já emitidos para seqs que foram confirmados.
             nacks_emitidos = {s for s in nacks_emitidos if s >= seq_esperado}
 
         if fim_seq is not None and seq_esperado > fim_seq:
@@ -367,10 +433,6 @@ def receber_seletivo(
             print('[SERVIDOR] Recebimento da carga util concluido.')
             print(f"[SERVIDOR] Mensagem reconstruida: '{mensagem_final}'")
             return
-
-        if seq_esperado not in mensagem_partes and seq_esperado not in nacks_emitidos:
-            enviar_nack(arquivo_socket, seq_esperado, f'Sequencia faltante {seq_esperado}.')
-            nacks_emitidos.add(seq_esperado)
 
 
 def receber_payload_com_ack(
@@ -415,15 +477,39 @@ def main():
                 print(f'[SERVIDOR] Conectado por {addr}')
                 conn.settimeout(HANDSHAKE_TIMEOUT)
 
-                with conn.makefile('rwb') as arquivo_socket:
+                # CORREÇÃO: uso de makefile separado para leitura e escrita
+                # evita possíveis deadlocks em ambientes onde readline() bloqueante
+                # pode conflitar com o buffer de escrita do mesmo descritor.
+                with conn.makefile('rb') as arq_leitura, conn.makefile('wb') as arq_escrita:
+
+                    class ArquivoDuplex:
+                        """Wrapper que separa leitura e escrita em dois makefile distintos."""
+                        def readline(self):
+                            return arq_leitura.readline()
+
+                        def write(self, data):
+                            return arq_escrita.write(data)
+
+                        def flush(self):
+                            return arq_escrita.flush()
+
+                    arquivo_socket = ArquivoDuplex()
+
                     try:
                         client_config = receber_json(arquivo_socket)
                     except socket.timeout:
-                        print(f'[SERVIDOR] Timeout ({HANDSHAKE_TIMEOUT}s) aguardando handshake de {addr}. Encerrando conexao.')
+                        print(
+                            f'[SERVIDOR] Timeout ({HANDSHAKE_TIMEOUT}s) aguardando handshake de {addr}. '
+                            'Encerrando conexao.'
+                        )
                         try:
                             enviar_json(
                                 arquivo_socket,
-                                {'tipo': 'handshake_ack', 'status': 'erro', 'mensagem': 'Timeout aguardando handshake.'},
+                                {
+                                    'tipo': 'handshake_ack',
+                                    'status': 'erro',
+                                    'mensagem': 'Timeout aguardando handshake.',
+                                },
                             )
                         except Exception:
                             pass
@@ -433,7 +519,11 @@ def main():
                         try:
                             enviar_json(
                                 arquivo_socket,
-                                {'tipo': 'handshake_ack', 'status': 'erro', 'mensagem': 'Handshake invalido ou conexao fechada.'},
+                                {
+                                    'tipo': 'handshake_ack',
+                                    'status': 'erro',
+                                    'mensagem': 'Handshake invalido ou conexao fechada.',
+                                },
                             )
                         except Exception:
                             pass
@@ -462,24 +552,34 @@ def main():
                     timeout_ack_ms = int(client_config.get('timeout_ack_ms', DEFAULT_TIMEOUT_ACK_MS))
                     max_retransmissoes = int(client_config.get('max_retransmissoes', DEFAULT_MAX_RETRANSMISSOES))
 
+                    # Calcula o timeout adequado para a fase de dados.
+                    # Se o settimeout falhar (raro), define um fallback seguro
+                    # em vez de silenciar o erro e ficar com HANDSHAKE_TIMEOUT.
+                    timeout_dados = max(2.0, (timeout_ack_ms / 1000.0) * (max_retransmissoes + 2))
                     try:
-                        conn.settimeout(max(2.0, (timeout_ack_ms / 1000.0) * (max_retransmissoes + 2)))
-                    except Exception:
-                        pass
+                        conn.settimeout(timeout_dados)
+                    except OSError as e:
+                        print(f'[SERVIDOR] Aviso: nao foi possivel ajustar timeout para {timeout_dados:.1f}s: {e}')
+                        # Fallback: usa timeout_dados diretamente na leitura via
+                        # socket.settimeout de novo com valor mínimo seguro.
+                        try:
+                            conn.settimeout(max(timeout_dados, HANDSHAKE_TIMEOUT + 1))
+                        except OSError:
+                            pass
 
                     tamanho_maximo_sessao = min(client_config['tamanho_maximo_desejado'], SERVER_BUFFER_SIZE)
 
                     # ----------------------------------------------------------
-                    # JANELA CONTROLADA PELO SERVIDOR (Observação 1 corrigida)
+                    # JANELA CONTROLADA PELO SERVIDOR
                     # O servidor determina o tamanho da janela da sessão.
-                    # Usa seu valor inicial configurado (padrão 5), respeitando
-                    # os limites globais. O cliente pode sugerir via janela_desejada,
-                    # mas a decisão final é sempre do servidor.
-                    # Para futuras extensões, este valor pode ser ajustado
-                    # dinamicamente pelo servidor durante a sessão.
+                    # O cliente pode sugerir via janela_desejada, mas a
+                    # decisão final é sempre do servidor.
                     # ----------------------------------------------------------
                     janela_sessao = janela_inicial
-                    print(f'[SERVIDOR] Janela da sessao definida pelo servidor: {janela_sessao} (cliente sugeriu: {client_config.get("janela_desejada", "?")})')
+                    print(
+                        f'[SERVIDOR] Janela da sessao definida pelo servidor: {janela_sessao} '
+                        f'(cliente sugeriu: {client_config.get("janela_desejada", "?")})'
+                    )
 
                     server_config = {
                         'tipo': 'handshake_ack',
@@ -513,14 +613,19 @@ def main():
                                 hmac_key=hmac_key,
                             )
                         except socket.timeout:
-                            print('[SERVIDOR] Timeout de inatividade no fluxo de dados. Encerrando conexao.')
+                            # CORREÇÃO: envia notificação ao cliente antes de encerrar,
+                            # evitando que o cliente fique bloqueado esperando ACK.
+                            print('[SERVIDOR] Timeout de inatividade no fluxo de dados. Notificando cliente...')
+                            enviar_mensagem_encerramento_servidor(arquivo_socket, addr)
+                            print('[SERVIDOR] Encerrando conexao.')
                             break
-                        except ConnectionError:
-                            print('[SERVIDOR] Cliente encerrou a conexao.')
+                        except ConnectionError as e:
+                            print(f'[SERVIDOR] Conexao encerrada: {e}')
                             break
                         except json.JSONDecodeError as erro:
                             print(f'[SERVIDOR] Erro de decodificacao JSON: {erro}')
                             break
+
         except OSError as erro:
             print(f'[SERVIDOR] Conexao com {addr} encerrada com erro de socket: {erro}')
 

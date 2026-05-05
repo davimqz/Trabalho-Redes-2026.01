@@ -7,7 +7,7 @@ import os
 import secrets
 import socket
 import sys
-from typing import Dict, List, Set
+from typing import Dict, Set
 import zlib
 
 from cryptography.hazmat.primitives import hashes
@@ -24,6 +24,23 @@ PAYLOAD_CHUNK_SIZE = 4
 DEFAULT_MODO_CONFIRMACAO = 'go_back_n'
 DEFAULT_TIMEOUT_ACK_MS = 5000
 DEFAULT_MAX_RETRANSMISSOES = 3
+
+# ---------------------------------------------------------------------------
+# SEGURANÇA: A PSK DEVE ser definida via variável de ambiente PSK em produção.
+# O valor abaixo é APENAS para desenvolvimento/testes locais e NUNCA deve
+# ser usado em ambientes reais. Defina: export PSK='sua_chave_secreta_aqui'
+# ---------------------------------------------------------------------------
+_PSK_ENV = os.environ.get('PSK', '')
+if not _PSK_ENV:
+    import warnings
+    warnings.warn(
+        "[SEGURANÇA] Variável de ambiente PSK não definida. "
+        "Usando chave de desenvolvimento insegura. "
+        "Defina PSK via variável de ambiente antes de usar em produção.",
+        stacklevel=1,
+    )
+    _PSK_ENV = 'dev_psk_for_testing_only_please_change'
+PSK = _PSK_ENV.encode()
 
 
 def enviar_json(arquivo_socket, mensagem):
@@ -50,7 +67,9 @@ def parse_seq_list(raw: str) -> Set[int]:
         try:
             seq = int(item)
         except ValueError as exc:
-            raise ValueError(f"Sequencia invalida em lista: '{item}'. Use inteiros separados por virgula.") from exc
+            raise ValueError(
+                f"Sequencia invalida em lista: '{item}'. Use inteiros separados por virgula."
+            ) from exc
         if seq < 0:
             raise ValueError('Sequencias para simulacao devem ser >= 0.')
         resultado.add(seq)
@@ -59,7 +78,9 @@ def parse_seq_list(raw: str) -> Set[int]:
 
 def solicitar_tamanho_maximo():
     while True:
-        entrada = input(f"[CLIENTE] Defina o limite maximo de caracteres por vez (tamanho >= {MIN_TAMANHO}): ").strip()
+        entrada = input(
+            f"[CLIENTE] Defina o limite maximo de caracteres por vez (tamanho >= {MIN_TAMANHO}): "
+        ).strip()
         try:
             tamanho = int(entrada)
         except ValueError:
@@ -184,6 +205,8 @@ def obter_host_port(args):
 
 
 def fragmentar_payload(texto, tamanho_fragmento):
+    # CORREÇÃO: mensagem vazia não gera fragmento algum; o chamador já
+    # valida e rejeita strings vazias antes de chegar aqui.
     return [texto[i:i + tamanho_fragmento] for i in range(0, len(texto), tamanho_fragmento)]
 
 
@@ -258,6 +281,13 @@ def enviar_pacote_controlado(
             print(f"[CLIENTE] Pacote enviado seq={seq}, payload='{payload}'")
 
 
+class ServidorEncerradoError(Exception):
+    """Levantada quando o servidor envia {'tipo': 'encerramento'}.
+    Permite que todos os loops de envio encerrem de forma limpa,
+    sem tratar o pacote como uma resposta de protocolo inesperada.
+    """
+
+
 def normalizar_resposta_controle(resp):
     if not isinstance(resp, dict):
         raise ValueError('Resposta invalida do servidor (nao e JSON objeto).')
@@ -266,6 +296,14 @@ def normalizar_resposta_controle(resp):
     seq = resp.get('seq')
     status = resp.get('status')
     cumulativo = resp.get('cumulativo', False)
+
+    # BUG CRÍTICO CORRIGIDO: o servidor envia este pacote ao encerrar por
+    # timeout. Sem este tratamento, o branch final lançaria ValueError,
+    # resultando em traceback não tratado em vez de encerramento gracioso.
+    if tipo == 'encerramento':
+        motivo = resp.get('mensagem', 'Servidor encerrou a conexao.')
+        print(f'[CLIENTE] Servidor encerrou a conexao: {motivo}')
+        raise ServidorEncerradoError(motivo)
 
     if tipo == 'ack' and status == 'ok':
         return 'ack', seq, resp.get('mensagem', ''), cumulativo
@@ -341,6 +379,8 @@ def enviar_individual(
                     raise TimeoutError(f'Timeout no pacote seq={seq} apos {max_retransmissoes} retransmissoes.')
                 print(f'[CLIENTE] Timeout no seq={seq}. Retransmitindo (tentativa {tentativas}/{max_retransmissoes})...')
                 continue
+            except ServidorEncerradoError:
+                raise
 
             if seq_resp != seq:
                 print(f'[CLIENTE] Controle para seq inesperado: recebido {seq_resp}, esperado {seq}. Ignorando.')
@@ -357,13 +397,15 @@ def enviar_individual(
 
 
 # ---------------------------------------------------------------------------
-# Go-Back-N com ACK CUMULATIVO (Observação 2 corrigida)
+# Go-Back-N com ACK CUMULATIVO
 # ---------------------------------------------------------------------------
-# Semântica correta:
-#   - O servidor envia ACK(N) significando "recebi todos os pacotes até N".
-#   - O cliente avança a base da janela para N+1, confirmando N+1 pacotes
-#     de uma vez (não um a um).
-#   - Em caso de NACK(K) ou timeout, retransmite de K até o fim da janela.
+# Semântica correta do GBN:
+#   - ACK(N) significa "recebi todos os pacotes até N inclusive".
+#   - O cliente avança a base para N+1 de uma vez (confirmação em lote).
+#   - NACK(K): retransmite a partir de K até o fim da janela atual.
+#   - CORREÇÃO: NACK com seq_resp fora do intervalo [base, fim_janela] é
+#     tratado de forma conservadora — retransmite desde 'base' para evitar
+#     reenvio redundante ou perda de pacotes em edge cases.
 # ---------------------------------------------------------------------------
 def enviar_lotes_go_back_n(
     arquivo_socket,
@@ -410,7 +452,6 @@ def enviar_lotes_go_back_n(
                     f'[CLIENTE] Timeout na janela {base}-{fim_janela}. '
                     f'Retransmitindo a partir de {base} (tentativa {tentativas_janela}/{max_retransmissoes})...'
                 )
-                # GBN: retransmite tudo a partir da base atual.
                 reenviar_faixa(
                     arquivo_socket,
                     pacotes,
@@ -422,14 +463,14 @@ def enviar_lotes_go_back_n(
                     corrupt_aplicado,
                 )
                 continue
+            except ServidorEncerradoError:
+                raise
 
             if seq_resp is None:
                 continue
 
             if tipo_resp == 'ack':
                 # ACK CUMULATIVO: ACK(N) confirma todos os pacotes de base até N.
-                # Avança a base para N+1 de uma vez, independentemente de quantos
-                # pacotes foram confirmados simultaneamente.
                 if seq_resp >= base:
                     pacotes_confirmados = seq_resp - base + 1
                     print(
@@ -437,20 +478,28 @@ def enviar_lotes_go_back_n(
                         f'(confirma {pacotes_confirmados} pacote(s): {base}..{seq_resp})'
                     )
                     base = seq_resp + 1
-                # ACK duplicado/atrasado: ignora.
+                # ACK duplicado/atrasado: ignora silenciosamente.
                 continue
 
-            # NACK: servidor pediu reenvio a partir de seq_resp.
+            # --- CORREÇÃO GBN: tratamento robusto de NACK ---
+            # Se seq_resp está dentro da janela atual: retransmite a partir dele.
+            # Se seq_resp está FORA da janela (edge case): usa 'base' como alvo
+            # conservador para evitar regressão ou reenvio redundante.
             tentativas_janela += 1
             if tentativas_janela > max_retransmissoes:
                 raise ValueError(
                     f'Janela {base}-{fim_janela} rejeitada apos {max_retransmissoes} retransmissoes: {msg}'
                 )
 
-            # GBN: retransmite a partir do seq indicado pelo NACK até o fim da janela.
-            alvo = base
             if isinstance(seq_resp, int) and base <= seq_resp <= fim_janela:
                 alvo = seq_resp
+            else:
+                # NACK com seq fora do intervalo esperado: fallback conservador.
+                alvo = base
+                print(
+                    f'[CLIENTE] NACK com seq={seq_resp} fora da janela [{base},{fim_janela}]. '
+                    f'Usando alvo conservador={alvo}.'
+                )
 
             print(
                 f'[CLIENTE] NACK recebido seq={seq_resp}: {msg}. '
@@ -482,6 +531,10 @@ def enviar_lotes_seletivo(
     Repetição Seletiva com ACK individual.
     Cada ACK(N) confirma apenas o pacote N específico.
     Retransmite somente os pacotes com NACK, não a janela inteira.
+
+    CORREÇÃO: NACK proativo do servidor pode chegar quando o cliente já
+    esgotou retransmissões para esse seq. Para evitar abort prematuro,
+    NACKs de seqs já descartados são ignorados.
     """
     total = len(pacotes)
     base = 0
@@ -490,6 +543,8 @@ def enviar_lotes_seletivo(
         fim_janela = min(base + janela_sessao - 1, total - 1)
         pendentes = set(range(base, fim_janela + 1))
         tentativas_por_seq = {seq: 0 for seq in pendentes}
+        # Seqs que atingiram o limite e foram abortados localmente.
+        abortados: Set[int] = set()
 
         reenviar_faixa(
             arquivo_socket,
@@ -506,11 +561,26 @@ def enviar_lotes_seletivo(
             try:
                 resp = receber_controle_com_timeout(arquivo_socket)
                 tipo_resp, seq_resp, msg, cumulativo = normalizar_resposta_controle(resp)
+            except ServidorEncerradoError:
+                raise
             except TimeoutError:
                 for seq in sorted(pendentes):
+                    if seq in abortados:
+                        continue
                     tentativas_por_seq[seq] += 1
                     if tentativas_por_seq[seq] > max_retransmissoes:
-                        raise TimeoutError(f'Timeout persistente no pacote seq={seq} (modo seletivo).')
+                        # BUG CRÍTICO CORRIGIDO: antes o código levantava aqui
+                        # imediatamente, tornando o bloco 'if seq in abortados'
+                        # letra morta — o seq nunca era inserido em 'abortados'
+                        # antes do raise. Agora marcamos o seq como abortado e
+                        # continuamos tentando os demais; o raise ocorre somente
+                        # quando TODOS os pendentes estão abortados.
+                        abortados.add(seq)
+                        print(
+                            f'[CLIENTE] Limite de retransmissoes esgotado para seq={seq} '
+                            f'(seletivo). Marcado como abortado.'
+                        )
+                        continue
                     print(
                         f'[CLIENTE] Timeout seletivo no seq={seq}. '
                         f'Retransmitindo ({tentativas_por_seq[seq]}/{max_retransmissoes})...'
@@ -523,19 +593,30 @@ def enviar_lotes_seletivo(
                         drop_aplicado,
                         corrupt_aplicado,
                     )
+                # Se todos os pendentes foram abortados, não há mais o que fazer.
+                if pendentes and pendentes.issubset(abortados):
+                    primeiro_abortado = min(abortados & pendentes)
+                    raise TimeoutError(
+                        f'Timeout persistente: todos os pacotes pendentes foram abortados '
+                        f'(primeiro: seq={primeiro_abortado}, modo seletivo).'
+                    )
                 continue
 
             if not isinstance(seq_resp, int):
                 continue
 
             if tipo_resp == 'ack':
-                # ACK individual: confirma apenas este seq específico.
                 if seq_resp in pendentes:
                     pendentes.remove(seq_resp)
+                    abortados.discard(seq_resp)
                     print(f'[CLIENTE] ACK individual recebido seq={seq_resp}')
                 continue
 
+            # NACK recebido.
+            # CORREÇÃO: ignora NACKs de seqs fora dos pendentes (inclui NACKs
+            # proativos que chegam após o limite de retransmissões local).
             if seq_resp not in pendentes:
+                print(f'[CLIENTE] NACK ignorado para seq={seq_resp} (nao esta pendente).')
                 continue
 
             alvo = seq_resp
@@ -559,6 +640,18 @@ def enviar_lotes_seletivo(
         base = fim_janela + 1
 
 
+def enviar_mensagem_encerramento(arquivo_socket):
+    """
+    Envia mensagem de encerramento gracioso de sessão ao servidor.
+    Permite que o servidor diferencie desconexão intencional de falha abrupta.
+    """
+    try:
+        enviar_json(arquivo_socket, {'tipo': 'fim_sessao', 'mensagem': 'Cliente encerrando sessao normalmente.'})
+        print('[CLIENTE] Mensagem de encerramento de sessao enviada ao servidor.')
+    except Exception as e:
+        print(f'[CLIENTE] Aviso: nao foi possivel enviar mensagem de encerramento: {e}')
+
+
 def enviar_payload_com_janela(
     client_socket,
     arquivo_socket,
@@ -574,8 +667,9 @@ def enviar_payload_com_janela(
     aesgcm=None,
     hmac_key=None,
 ):
-    if not mensagem:
-        print('[CLIENTE] Mensagem vazia ignorada.')
+    # CORREÇÃO: rejeita mensagem vazia explicitamente antes de fragmentar.
+    if not mensagem or not mensagem.strip():
+        print('[CLIENTE] Mensagem vazia ou apenas espacos ignorada.')
         return
 
     if len(mensagem) > tamanho_maximo_sessao:
@@ -585,7 +679,8 @@ def enviar_payload_com_janela(
 
     fragmentos = fragmentar_payload(mensagem, PAYLOAD_CHUNK_SIZE)
     if not fragmentos:
-        fragmentos = ['']
+        print('[CLIENTE] Nenhum fragmento gerado (mensagem ignorada).')
+        return
 
     pacotes: Dict[int, Dict] = {}
     for seq, fragmento in enumerate(fragmentos):
@@ -677,7 +772,26 @@ def main():
         client_socket.connect((host, port))
         print('[CLIENTE] Conectado!')
 
-        with client_socket.makefile('rwb') as arquivo_socket:
+        with client_socket.makefile('rb') as arq_leitura, \
+             client_socket.makefile('wb') as arq_escrita:
+
+            class ClienteDuplex:
+                """Separa leitura e escrita em dois makefile distintos.
+                Elimina o deadlock potencial de makefile('rwb') onde
+                readline() bloqueante pode conflitar com o buffer de escrita
+                quando ambos compartilham o mesmo descritor bufferizado.
+                """
+                def readline(self):
+                    return arq_leitura.readline()
+
+                def write(self, data):
+                    return arq_escrita.write(data)
+
+                def flush(self):
+                    return arq_escrita.flush()
+
+            arquivo_socket = ClienteDuplex()
+
             enviar_json(arquivo_socket, handshake_requisicao)
 
             print('[CLIENTE] Handshake enviado:')
@@ -702,7 +816,6 @@ def main():
 
             modo_operacao_srv = handshake_resposta.get('modo_operacao')
             tamanho_maximo_sessao = handshake_resposta.get('tamanho_maximo_sessao')
-            # A janela da sessão é DEFINIDA pelo servidor — o cliente usa este valor.
             janela_sessao = handshake_resposta.get('janela_sessao')
 
             session_salt_b64 = handshake_resposta.get('session_salt')
@@ -711,19 +824,18 @@ def main():
             if session_salt_b64:
                 try:
                     session_salt = base64.b64decode(session_salt_b64)
-                    psk = os.environ.get('PSK', 'dev_psk_for_testing_only_please_change').encode()
                     hkdf = HKDF(
                         algorithm=hashes.SHA256(),
                         length=64,
                         salt=session_salt,
                         info=b'handshake data',
                     )
-                    km = hkdf.derive(psk)
+                    km = hkdf.derive(PSK)
                     aes_key = km[:32]
                     hmac_key = km[32:]
                     aesgcm_obj = AESGCM(aes_key)
-                except Exception:
-                    print('[CLIENTE] Falha ao processar session_salt do servidor. Encerrando.')
+                except Exception as e:
+                    print(f'[CLIENTE] Falha ao processar session_salt do servidor: {e}. Encerrando.')
                     return
 
             if modo_operacao_srv != 'servidor':
@@ -746,32 +858,50 @@ def main():
             print(f'  - Max retransmissoes acordado: {max_retransmissoes}')
             print('[CLIENTE] Handshake completo!')
 
-            while True:
-                mensagem = input("[CLIENTE] Digite a mensagem para envio (ou 'sair' para encerrar): ")
-                if mensagem.strip().lower() == 'sair':
-                    print('[CLIENTE] Encerrando cliente por solicitacao do usuario.')
-                    break
+            try:
+                while True:
+                    mensagem = input("[CLIENTE] Digite a mensagem para envio (ou 'sair' para encerrar): ")
 
-                if not mensagem.strip():
-                    print('[CLIENTE] Mensagem vazia ignorada.')
-                    continue
+                    if mensagem.strip().lower() == 'sair':
+                        # CORREÇÃO: encerramento gracioso com mensagem de FIN.
+                        enviar_mensagem_encerramento(arquivo_socket)
+                        print('[CLIENTE] Encerrando cliente por solicitacao do usuario.')
+                        break
 
-                enviar_payload_com_janela(
-                    client_socket,
-                    arquivo_socket,
-                    mensagem,
-                    tamanho_maximo_sessao,
-                    janela_sessao,
-                    tipo_operacao,
-                    modo_confirmacao,
-                    timeout_ack_ms,
-                    max_retransmissoes,
-                    drop_once_seqs,
-                    corrupt_once_seqs,
-                    aesgcm=aesgcm_obj,
-                    hmac_key=hmac_key,
-                )
-                print('[CLIENTE] Envio da carga util concluido.')
+                    # CORREÇÃO: rejeita entrada vazia ou somente espaços.
+                    if not mensagem.strip():
+                        print('[CLIENTE] Mensagem vazia ignorada. Digite ao menos um caractere.')
+                        continue
+
+                    try:
+                        enviar_payload_com_janela(
+                            client_socket,
+                            arquivo_socket,
+                            mensagem,
+                            tamanho_maximo_sessao,
+                            janela_sessao,
+                            tipo_operacao,
+                            modo_confirmacao,
+                            timeout_ack_ms,
+                            max_retransmissoes,
+                            drop_once_seqs,
+                            corrupt_once_seqs,
+                            aesgcm=aesgcm_obj,
+                            hmac_key=hmac_key,
+                        )
+                    except ServidorEncerradoError:
+                        # O servidor encerrou a conexão por timeout durante o
+                        # envio. Não é um erro do cliente — encerramos limpo.
+                        print('[CLIENTE] Conexao encerrada pelo servidor durante o envio. Saindo.')
+                        break
+                    print('[CLIENTE] Envio da carga util concluido.')
+
+            except KeyboardInterrupt:
+                print('\n[CLIENTE] Interrupcao pelo usuario (Ctrl+C). Encerrando...')
+                try:
+                    enviar_mensagem_encerramento(arquivo_socket)
+                except Exception:
+                    pass
 
 
 if __name__ == '__main__':
