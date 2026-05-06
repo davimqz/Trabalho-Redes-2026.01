@@ -49,11 +49,26 @@ PSK = _PSK_ENV.encode()
 
 
 def enviar_json(arquivo_socket, mensagem):
+    """
+    Serializa e envia uma mensagem JSON por meio de um socket.
+
+    Converte a mensagem para uma string JSON,
+    adiciona uma quebra de linha como delimitador e escreve no arquivo de socket
+
+    """
     arquivo_socket.write((json.dumps(mensagem) + '\n').encode('utf-8'))
     arquivo_socket.flush()
 
 
 def receber_json(arquivo_socket):
+    """
+    Recebe e desserializa uma mensagem JSON de um socket.
+
+    Lê uma linha do arquivo de socket, decodifica
+    de UTF-8 e converte o conteúdo JSON para um objeto Python.
+    Lança um erro caso a conexão tenha sido encerrada pelo cliente.
+
+    """
     linha = arquivo_socket.readline()
     if not linha:
         raise ConnectionError('Conexao encerrada pelo cliente.')
