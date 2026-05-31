@@ -1,285 +1,418 @@
-﻿import argparse
+#!/usr/bin/env python3
+"""
+Servidor TCP com transporte confiavel na camada de aplicacao.
+
+Implementa:
+- sockets TCP;
+- protocolo JSON por linha;
+- handshake de sessao;
+- limite de tamanho de mensagem definido no inicio;
+- payload maximo de 4 caracteres por pacote;
+- checksum CRC32;
+- temporizador por socket;
+- numeros de sequencia;
+- ACK positivo;
+- NACK negativo;
+- janela definida pelo servidor, de 1 a 5, padrao 5;
+- envio individual como Stop-and-Wait;
+- envio em lotes com Go-Back-N ou repeticao seletiva;
+- criptografia simetrica opcional com AES-GCM;
+- HMAC-SHA256 para autenticacao dos metadados criptografados principais;
+- tratamento de encerramento gracioso.
+"""
+
+from __future__ import annotations
+
+import argparse
 import base64
 import hashlib
 import hmac
 import json
 import os
 import socket
-import threading
 import sys
-from typing import Dict, Optional, Set
+import threading
+import warnings
 import zlib
+from typing import Dict, Optional, Tuple
 
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+try:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    CRYPTO_AVAILABLE = True
+except ImportError:  # pragma: no cover - depende do ambiente do avaliador
+    AESGCM = None  # type: ignore
+    HKDF = None  # type: ignore
+    hashes = None  # type: ignore
+    CRYPTO_AVAILABLE = False
 
-DEFAULT_HOST = '127.0.0.1'
+
+DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5000
 SERVER_BUFFER_SIZE = 4096
 MIN_TAMANHO = 30
 MIN_JANELA = 1
 MAX_JANELA = 5
-# O servidor é quem determina o tamanho inicial da janela (requisito do enunciado).
-# O cliente pode sugerir um valor via janela_desejada, mas a decisão final é do servidor.
 JANELA_INICIAL_SERVIDOR = 5
 PAYLOAD_CHUNK_SIZE = 4
 HANDSHAKE_TIMEOUT = 10
-DEFAULT_MODO_CONFIRMACAO = 'go_back_n'
+DEFAULT_MODO_CONFIRMACAO = "go_back_n"
 DEFAULT_TIMEOUT_ACK_MS = 5000
 DEFAULT_MAX_RETRANSMISSOES = 3
-ACCEPTED_MODO_OPERACAO = 'cliente'
+ACCEPTED_MODO_OPERACAO = "cliente"
+VERSAO_PROTOCOLO_SUPORTADA = 2
+RECV_CHUNK_SIZE = 4096
 
-# ---------------------------------------------------------------------------
-# SEGURANÇA: A PSK DEVE ser definida via variável de ambiente PSK em produção.
-# O valor abaixo é APENAS para desenvolvimento/testes locais e NUNCA deve
-# ser usado em ambientes reais. Defina: export PSK='sua_chave_secreta_aqui'
-# ---------------------------------------------------------------------------
-_PSK_ENV = os.environ.get('PSK', '')
+_PSK_ENV = os.environ.get("PSK", "")
 if not _PSK_ENV:
-    import warnings
     warnings.warn(
-        "[SEGURANÇA] Variável de ambiente PSK não definida. "
+        "[SEGURANCA] Variavel de ambiente PSK nao definida. "
         "Usando chave de desenvolvimento insegura. "
-        "Defina PSK via variável de ambiente antes de usar em produção.",
+        "Defina PSK antes da apresentacao: export PSK='sua_chave'.",
         stacklevel=1,
     )
-    _PSK_ENV = 'dev_psk_for_testing_only_please_change'
-PSK = _PSK_ENV.encode()
+    _PSK_ENV = "dev_psk_for_testing_only_please_change"
+PSK = _PSK_ENV.encode("utf-8")
 
 
-def enviar_json(arquivo_socket, mensagem):
-    arquivo_socket.write((json.dumps(mensagem) + '\n').encode('utf-8'))
-    arquivo_socket.flush()
+class JsonLineSocket:
+    """JSON por linha sobre socket usando recv/sendall, sem makefile().
+
+    O uso direto de recv() evita o problema em que socket.makefile().readline()
+    pode ficar inutilizavel depois de socket.timeout.
+    """
+
+    def __init__(self, sock: socket.socket, peer_label: str = "peer") -> None:
+        self.sock = sock
+        self.peer_label = peer_label
+        self._recv_buffer = b""
+
+    def write(self, data: bytes) -> int:
+        self.sock.sendall(data)
+        return len(data)
+
+    def flush(self) -> None:
+        return None
+
+    def readline(self) -> bytes:
+        while b"\n" not in self._recv_buffer:
+            chunk = self.sock.recv(RECV_CHUNK_SIZE)
+            if not chunk:
+                if self._recv_buffer:
+                    line = self._recv_buffer
+                    self._recv_buffer = b""
+                    return line
+                return b""
+            self._recv_buffer += chunk
+
+        line, self._recv_buffer = self._recv_buffer.split(b"\n", 1)
+        return line + b"\n"
 
 
-def receber_json(arquivo_socket):
-    linha = arquivo_socket.readline()
+def enviar_json(canal: JsonLineSocket, mensagem: dict) -> None:
+    canal.write((json.dumps(mensagem, ensure_ascii=False) + "\n").encode("utf-8"))
+    canal.flush()
+
+
+def receber_json(canal: JsonLineSocket) -> dict:
+    linha = canal.readline()
     if not linha:
-        raise ConnectionError('Conexao encerrada pelo cliente.')
-    return json.loads(linha.decode('utf-8'))
+        raise ConnectionError("Conexao encerrada pelo cliente.")
+    obj = json.loads(linha.decode("utf-8"))
+    if not isinstance(obj, dict):
+        raise ValueError("Mensagem JSON recebida nao e um objeto.")
+    return obj
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='Servidor TCP com confiabilidade na camada de aplicacao.')
-    parser.add_argument('--host', type=str, help='Host/IP para bind do servidor.')
-    parser.add_argument('--port', type=int, help='Porta para bind do servidor.')
+def calcular_checksum(payload: str) -> str:
+    return f"{zlib.crc32(payload.encode('utf-8')) & 0xFFFFFFFF:08x}"
+
+
+def montar_hmac_data(seq: int, fim: bool, nonce: bytes, ciphertext: bytes) -> bytes:
+    return (
+        b"trabalho-i-v2|dados|"
+        + int(seq).to_bytes(8, "big", signed=False)
+        + (b"\x01" if fim else b"\x00")
+        + nonce
+        + ciphertext
+    )
+
+
+def derive_session_keys(session_salt: bytes) -> Tuple[object, bytes]:
+    if not CRYPTO_AVAILABLE:
+        raise RuntimeError("Biblioteca cryptography nao esta instalada.")
+
+    hkdf = HKDF(  # type: ignore[misc]
+        algorithm=hashes.SHA256(),  # type: ignore[union-attr]
+        length=64,
+        salt=session_salt,
+        info=b"trabalho-i-handshake-v2",
+    )
+    key_material = hkdf.derive(PSK)
+    aes_key = key_material[:32]
+    hmac_key = key_material[32:]
+    return AESGCM(aes_key), hmac_key  # type: ignore[operator]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Servidor TCP com confiabilidade na camada de aplicacao."
+    )
+    parser.add_argument("--host", type=str, help="Host/IP para bind do servidor.")
+    parser.add_argument("--port", type=int, help="Porta para bind do servidor.")
     parser.add_argument(
-        '--modo-confirmacao-padrao',
-        choices=['go_back_n', 'seletivo'],
+        "--modo-confirmacao-padrao",
+        choices=["go_back_n", "seletivo"],
         default=DEFAULT_MODO_CONFIRMACAO,
-        help='Modo aplicado quando o cliente nao informar modo_confirmacao.',
+        help="Modo aplicado quando o cliente nao informar modo_confirmacao.",
     )
     parser.add_argument(
-        '--janela-inicial',
+        "--janela-inicial",
         type=int,
         default=JANELA_INICIAL_SERVIDOR,
-        help=f'Janela inicial definida pelo servidor ({MIN_JANELA}-{MAX_JANELA}, padrao {JANELA_INICIAL_SERVIDOR}).',
+        help=f"Janela definida pelo servidor ({MIN_JANELA}-{MAX_JANELA}, padrao {JANELA_INICIAL_SERVIDOR}).",
     )
     return parser.parse_args()
 
 
-def obter_host_port(args):
+def obter_host_port(args: argparse.Namespace) -> Tuple[str, int]:
     host = args.host
     port = args.port
 
     if host is None and sys.stdin.isatty():
-        entrada_host = input(f'[SERVIDOR] Host para bind (Enter para {DEFAULT_HOST}): ').strip()
+        entrada_host = input(f"[SERVIDOR] Host para bind (Enter para {DEFAULT_HOST}): ").strip()
         host = entrada_host or DEFAULT_HOST
     elif host is None:
         host = DEFAULT_HOST
 
     if port is None and sys.stdin.isatty():
         while True:
-            entrada_port = input(f'[SERVIDOR] Porta para bind (Enter para {DEFAULT_PORT}): ').strip()
-            if entrada_port == '':
+            entrada_port = input(f"[SERVIDOR] Porta para bind (Enter para {DEFAULT_PORT}): ").strip()
+            if entrada_port == "":
                 port = DEFAULT_PORT
                 break
             try:
                 port = int(entrada_port)
             except ValueError:
-                print('[SERVIDOR] Porta invalida. Digite um inteiro.')
+                print("[SERVIDOR] Porta invalida. Digite um inteiro.")
                 continue
             break
     elif port is None:
         port = DEFAULT_PORT
 
     if port <= 0 or port > 65535:
-        raise ValueError('Porta deve estar entre 1 e 65535.')
+        raise ValueError("Porta deve estar entre 1 e 65535.")
 
     return host, port
 
 
-VERSAO_PROTOCOLO_SUPORTADA = 2
+def validar_handshake(cliente_handshake: dict, modo_confirmacao_padrao: str) -> Tuple[bool, str]:
+    if cliente_handshake.get("tipo") != "handshake":
+        return False, "Mensagem inicial nao e um handshake valido."
 
-
-def validar_handshake(cliente_handshake, modo_confirmacao_padrao):
-    if cliente_handshake.get('tipo') != 'handshake':
-        return False, 'Mensagem inicial nao e um handshake valido.'
-
-    # Validação de versão: rejeita clientes com versão incompatível.
-    versao = cliente_handshake.get('versao_protocolo')
+    versao = cliente_handshake.get("versao_protocolo")
     if versao != VERSAO_PROTOCOLO_SUPORTADA:
         return False, (
             f"Versao de protocolo incompativel: recebido {versao!r}, "
             f"esperado {VERSAO_PROTOCOLO_SUPORTADA}."
         )
 
-    modo_operacao = cliente_handshake.get('modo_operacao')
+    modo_operacao = cliente_handshake.get("modo_operacao")
     if modo_operacao != ACCEPTED_MODO_OPERACAO:
         return False, f"Campo modo_operacao invalido. Esperado '{ACCEPTED_MODO_OPERACAO}'."
 
-    tamanho_desejado = cliente_handshake.get('tamanho_maximo_desejado')
-    janela_desejada = cliente_handshake.get('janela_desejada', JANELA_INICIAL_SERVIDOR)
-    tipo_operacao = cliente_handshake.get('tipo_operacao', 'lotes')
-    modo_confirmacao = cliente_handshake.get('modo_confirmacao', modo_confirmacao_padrao)
-    timeout_ack_ms = cliente_handshake.get('timeout_ack_ms', DEFAULT_TIMEOUT_ACK_MS)
-    max_retransmissoes = cliente_handshake.get('max_retransmissoes', DEFAULT_MAX_RETRANSMISSOES)
+    tamanho_desejado = cliente_handshake.get("tamanho_maximo_desejado")
+    janela_desejada = cliente_handshake.get("janela_desejada", JANELA_INICIAL_SERVIDOR)
+    tipo_operacao = cliente_handshake.get("tipo_operacao", "lotes")
+    modo_confirmacao = cliente_handshake.get("modo_confirmacao", modo_confirmacao_padrao)
+    timeout_ack_ms = cliente_handshake.get("timeout_ack_ms", DEFAULT_TIMEOUT_ACK_MS)
+    max_retransmissoes = cliente_handshake.get("max_retransmissoes", DEFAULT_MAX_RETRANSMISSOES)
+    criptografia_desejada = cliente_handshake.get("criptografia_desejada", True)
 
     if not isinstance(tamanho_desejado, int):
-        return False, 'Campo tamanho_maximo_desejado deve ser inteiro.'
+        return False, "Campo tamanho_maximo_desejado deve ser inteiro."
     if tamanho_desejado < MIN_TAMANHO:
-        return False, f'Campo tamanho_maximo_desejado deve ser >= {MIN_TAMANHO}.'
+        return False, f"Campo tamanho_maximo_desejado deve ser >= {MIN_TAMANHO}."
 
     if not isinstance(janela_desejada, int):
-        return False, 'Campo janela_desejada deve ser inteiro.'
+        return False, "Campo janela_desejada deve ser inteiro."
     if janela_desejada < MIN_JANELA or janela_desejada > MAX_JANELA:
-        return False, f'Campo janela_desejada deve estar entre {MIN_JANELA} e {MAX_JANELA}.'
+        return False, f"Campo janela_desejada deve estar entre {MIN_JANELA} e {MAX_JANELA}."
 
-    if tipo_operacao not in ('individual', 'lotes'):
+    if tipo_operacao not in ("individual", "lotes"):
         return False, "Campo tipo_operacao deve ser 'individual' ou 'lotes'."
 
-    if modo_confirmacao not in ('go_back_n', 'seletivo'):
+    if modo_confirmacao not in ("go_back_n", "seletivo"):
         return False, "Campo modo_confirmacao deve ser 'go_back_n' ou 'seletivo'."
 
     if not isinstance(timeout_ack_ms, int) or timeout_ack_ms <= 0:
-        return False, 'Campo timeout_ack_ms deve ser inteiro > 0.'
+        return False, "Campo timeout_ack_ms deve ser inteiro > 0."
 
     if not isinstance(max_retransmissoes, int) or max_retransmissoes < 0:
-        return False, 'Campo max_retransmissoes deve ser inteiro >= 0.'
+        return False, "Campo max_retransmissoes deve ser inteiro >= 0."
 
-    return True, ''
+    if not isinstance(criptografia_desejada, bool):
+        return False, "Campo criptografia_desejada deve ser booleano."
 
+    if criptografia_desejada and not CRYPTO_AVAILABLE:
+        return False, "Criptografia solicitada, mas a biblioteca cryptography nao esta instalada."
 
-def derive_session_keys(session_salt: bytes):
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(),
-        length=64,
-        salt=session_salt,
-        info=b'handshake data',
-    )
-    key_material = hkdf.derive(PSK)
-    aes_key = key_material[:32]
-    hmac_key = key_material[32:]
-    return AESGCM(aes_key), hmac_key
+    return True, ""
 
 
-def validar_pacote_payload(pacote, aesgcm, hmac_key):
-    seq_raw = pacote.get('seq')
-    if not isinstance(seq_raw, int):
-        return None, None, 'Campo seq deve ser inteiro.'
-
-    if pacote.get('tipo') != 'dados':
-        return seq_raw, None, 'Mensagem fora do protocolo de dados.'
-
-    if 'ciphertext' in pacote:
-        if aesgcm is None or hmac_key is None:
-            return seq_raw, None, 'Servidor nao suporta criptografia nesta sessao.'
-        try:
-            nonce = base64.b64decode(pacote.get('nonce', ''))
-            ciphertext = base64.b64decode(pacote.get('ciphertext', ''))
-        except Exception:
-            return seq_raw, None, 'Formato de ciphertext/nonce invalido.'
-
-        recv_hmac = pacote.get('hmac', '')
-        mac = hmac.new(hmac_key, nonce + ciphertext + int(seq_raw).to_bytes(4, 'big'), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(mac, recv_hmac):
-            return seq_raw, None, 'Falha na verificacao de integridade (HMAC).'
-
-        try:
-            payload = aesgcm.decrypt(nonce, ciphertext, None).decode('utf-8')
-        except Exception:
-            return seq_raw, None, 'Falha na autenticacao do ciphertext.'
-    else:
-        payload = pacote.get('payload', '')
-        recv_checksum = pacote.get('checksum')
-        if recv_checksum is None:
-            return seq_raw, None, 'Falta checksum no pacote sem criptografia.'
-        try:
-            calc = '{:08x}'.format(zlib.crc32(payload.encode('utf-8')) & 0xFFFFFFFF)
-        except Exception:
-            return seq_raw, None, 'Erro ao calcular checksum.'
-        if calc != recv_checksum:
-            return seq_raw, None, 'Falha na verificacao de integridade (checksum).'
-
-    if not isinstance(payload, str):
-        return seq_raw, None, 'Payload deve ser texto.'
-    if len(payload) > PAYLOAD_CHUNK_SIZE:
-        return seq_raw, None, f'Payload excede {PAYLOAD_CHUNK_SIZE} caracteres por pacote.'
-
-    return seq_raw, payload, ''
-
-
-def enviar_nack(arquivo_socket, seq, mensagem):
+def enviar_ack(arquivo_socket: JsonLineSocket, seq: int, cumulativo: bool) -> None:
     enviar_json(
         arquivo_socket,
         {
-            'tipo': 'nack',
-            'seq': seq,
-            'status': 'reenviar',
-            'mensagem': mensagem,
+            "tipo": "ack",
+            "seq": seq,
+            "status": "ok",
+            "cumulativo": cumulativo,
+            "mensagem": "Recebido com sucesso.",
         },
     )
 
 
-def enviar_mensagem_encerramento_servidor(arquivo_socket, addr):
-    """
-    Envia ao cliente uma notificação de que o servidor está encerrando
-    a conexão por timeout, permitindo que o cliente não fique bloqueado.
-    """
+def enviar_ack_cumulativo(arquivo_socket: JsonLineSocket, seq: int) -> None:
+    enviar_ack(arquivo_socket, seq, True)
+
+
+def enviar_ack_individual(arquivo_socket: JsonLineSocket, seq: int) -> None:
+    enviar_ack(arquivo_socket, seq, False)
+
+
+def enviar_nack(arquivo_socket: JsonLineSocket, seq: int, mensagem: str) -> None:
+    enviar_json(
+        arquivo_socket,
+        {
+            "tipo": "nack",
+            "seq": seq,
+            "status": "reenviar",
+            "mensagem": mensagem,
+        },
+    )
+    print(f"[SERVIDOR] NACK enviado seq={seq} motivo='{mensagem}'")
+
+
+def enviar_mensagem_encerramento_servidor(arquivo_socket: JsonLineSocket, addr: object) -> None:
     try:
         enviar_json(
             arquivo_socket,
             {
-                'tipo': 'encerramento',
-                'status': 'timeout',
-                'mensagem': 'Servidor encerrando conexao por inatividade.',
+                "tipo": "encerramento",
+                "status": "timeout",
+                "mensagem": "Servidor encerrando conexao por inatividade.",
             },
         )
-        print(f'[SERVIDOR] Notificacao de encerramento enviada a {addr}.')
-    except Exception as e:
-        print(f'[SERVIDOR] Nao foi possivel notificar {addr} do encerramento: {e}')
+        print(f"[SERVIDOR] Notificacao de encerramento enviada a {addr}.")
+    except Exception as erro:  # pragma: no cover - so loga falha de rede
+        print(f"[SERVIDOR] Nao foi possivel notificar {addr}: {erro}")
 
 
-def _log_pacote_recebido(seq, payload, pacote):
-    """Imprime log de pacote recebido com metadados de integridade."""
-    if 'ciphertext' in pacote:
-        nonce_b64 = pacote.get('nonce', '')
-        hmac_val = pacote.get('hmac', '')
-        meta = f", nonce={nonce_b64[:6]}..., hmac={hmac_val[:6]}..."
+def validar_pacote_payload(pacote: dict, aesgcm: Optional[object], hmac_key: Optional[bytes]) -> Tuple[Optional[int], Optional[str], str]:
+    if pacote.get("tipo") != "dados":
+        return None, None, "Mensagem fora do protocolo de dados."
+
+    seq_raw = pacote.get("seq")
+    if not isinstance(seq_raw, int) or seq_raw < 0:
+        return None, None, "Campo seq deve ser inteiro >= 0."
+
+    fim_raw = pacote.get("fim")
+    if not isinstance(fim_raw, bool):
+        return seq_raw, None, "Campo fim deve ser booleano."
+
+    recv_checksum = pacote.get("checksum")
+    if not isinstance(recv_checksum, str) or len(recv_checksum) != 8:
+        return seq_raw, None, "Falta checksum valido no pacote."
+
+    if "ciphertext" in pacote:
+        if aesgcm is None or hmac_key is None:
+            return seq_raw, None, "Pacote criptografado recebido em sessao sem criptografia."
+        try:
+            nonce = base64.b64decode(pacote.get("nonce", ""), validate=True)
+            ciphertext = base64.b64decode(pacote.get("ciphertext", ""), validate=True)
+        except Exception:
+            return seq_raw, None, "Formato de ciphertext/nonce invalido."
+
+        if len(nonce) != 12:
+            return seq_raw, None, "Nonce AES-GCM deve ter 12 bytes."
+
+        recv_hmac = pacote.get("hmac", "")
+        if not isinstance(recv_hmac, str):
+            return seq_raw, None, "HMAC ausente ou invalido."
+
+        mac = hmac.new(
+            hmac_key,
+            montar_hmac_data(seq_raw, fim_raw, nonce, ciphertext),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(mac, recv_hmac):
+            return seq_raw, None, "Falha na verificacao de integridade (HMAC)."
+
+        try:
+            payload = aesgcm.decrypt(nonce, ciphertext, None).decode("utf-8")  # type: ignore[attr-defined]
+        except Exception:
+            return seq_raw, None, "Falha na autenticacao/descriptografia do ciphertext."
+
+        calc_checksum = calcular_checksum(payload)
+        if calc_checksum != recv_checksum:
+            return seq_raw, None, "Falha na verificacao de integridade (checksum)."
     else:
-        checksum = pacote.get('checksum')
-        meta = f", checksum={checksum}"
-    print(f"[SERVIDOR] Pacote recebido seq={seq}, payload='{payload}'{meta}")
+        payload = pacote.get("payload")
+        if not isinstance(payload, str):
+            return seq_raw, None, "Payload deve ser texto."
+
+        calc_checksum = calcular_checksum(payload)
+        if calc_checksum != recv_checksum:
+            return seq_raw, None, "Falha na verificacao de integridade (checksum)."
+
+    if not isinstance(payload, str):
+        return seq_raw, None, "Payload deve ser texto."
+    if len(payload) == 0:
+        return seq_raw, None, "Payload vazio nao e aceito."
+    if len(payload) > PAYLOAD_CHUNK_SIZE:
+        return seq_raw, None, f"Payload excede {PAYLOAD_CHUNK_SIZE} caracteres por pacote."
+
+    return seq_raw, payload, ""
 
 
-# ---------------------------------------------------------------------------
-# Go-Back-N com ACK CUMULATIVO
-# ---------------------------------------------------------------------------
-# Semântica correta do GBN:
-#   - O receptor aceita apenas pacotes em ordem (seq == seq_esperado).
-#   - Ao receber seq correto, envia ACK cumulativo: ACK(N) significa
-#     "recebi todos os pacotes até N inclusive — próximo esperado é N+1".
-#   - Pacotes fora de ordem são descartados (NACK de seq_esperado).
-#   - CORREÇÃO: mensagem de tipo 'fim_sessao' é tratada graciosamente.
-# ---------------------------------------------------------------------------
+def _log_pacote_recebido(seq: int, payload: str, pacote: dict) -> None:
+    fim = bool(pacote.get("fim", False))
+    checksum = pacote.get("checksum")
+    criptografado = "ciphertext" in pacote
+    if criptografado:
+        nonce = str(pacote.get("nonce", ""))
+        hmac_val = str(pacote.get("hmac", ""))
+        print(
+            f"[SERVIDOR] DADOS seq={seq} fim={fim} len_payload={len(payload)} "
+            f"checksum={checksum} criptografado=True nonce={nonce[:8]}... hmac={hmac_val[:8]}..."
+        )
+    else:
+        print(
+            f"[SERVIDOR] DADOS seq={seq} fim={fim} len_payload={len(payload)} "
+            f"payload='{payload}' checksum={checksum} criptografado=False"
+        )
+
+
+def _validar_limite_mensagem(mensagem_partes: Dict[int, str], payload: str, tamanho_maximo_sessao: int) -> bool:
+    return (sum(len(v) for v in mensagem_partes.values()) + len(payload)) <= tamanho_maximo_sessao
+
+
 def receber_gbn(
-    arquivo_socket,
-    tamanho_maximo_sessao,
-    janela_sessao,
-    aesgcm=None,
-    hmac_key=None,
-):
+    arquivo_socket: JsonLineSocket,
+    tamanho_maximo_sessao: int,
+    janela_sessao: int,
+    aesgcm: Optional[object] = None,
+    hmac_key: Optional[bytes] = None,
+) -> None:
+    """Go-Back-N com ACK cumulativo.
+
+    O receptor aceita apenas o proximo seq esperado. Pacotes futuros sao
+    descartados com NACK do seq esperado. Pacotes duplicados antigos geram
+    reenvio do ultimo ACK cumulativo, evitando NACK obsoleto.
+    """
+
     mensagem_partes: Dict[int, str] = {}
     fim_seq: Optional[int] = None
     seq_esperado = 0
@@ -287,170 +420,147 @@ def receber_gbn(
     while True:
         pacote = receber_json(arquivo_socket)
 
-        # CORREÇÃO: trata encerramento gracioso enviado pelo cliente.
-        if isinstance(pacote, dict) and pacote.get('tipo') == 'fim_sessao':
+        if pacote.get("tipo") == "fim_sessao":
             print(f"[SERVIDOR] Encerramento gracioso recebido: {pacote.get('mensagem', '')}")
-            raise ConnectionError('Cliente encerrou a sessao normalmente.')
+            raise ConnectionError("Cliente encerrou a sessao normalmente.")
 
-        seq, payload, erro = validar_pacote_payload(pacote, aesgcm, hmac_key)
-
-        if erro:
-            # Pacote inválido: NACK pedindo reenvio do seq esperado.
-            enviar_nack(arquivo_socket, seq_esperado, erro)
-            continue
-
-        fim = bool(pacote.get('fim', False))
-
-        if seq != seq_esperado:
-            # GBN: descarta pacote fora de ordem, pede reenvio a partir de seq_esperado.
-            enviar_nack(
-                arquivo_socket,
-                seq_esperado,
-                f'Sequencia inesperada. Esperado {seq_esperado}, recebido {seq}.',
+        seq_raw = pacote.get("seq")
+        if isinstance(seq_raw, int) and seq_raw < seq_esperado:
+            ultimo_confirmado = seq_esperado - 1
+            enviar_ack_cumulativo(arquivo_socket, ultimo_confirmado)
+            print(
+                f"[SERVIDOR] Duplicado GBN seq={seq_raw}. "
+                f"Reenviando ACK cumulativo seq={ultimo_confirmado}."
             )
             continue
 
-        tamanho_novo = sum(len(v) for v in mensagem_partes.values()) + len(payload)
-        if tamanho_novo > tamanho_maximo_sessao:
-            enviar_nack(arquivo_socket, seq, f'Mensagem total excede o limite da sessao ({tamanho_maximo_sessao}).')
+        seq, payload, erro = validar_pacote_payload(pacote, aesgcm, hmac_key)
+        if erro:
+            enviar_nack(arquivo_socket, seq_esperado, erro)
+            continue
+
+        assert seq is not None
+        assert payload is not None
+
+        if seq > seq_esperado:
+            enviar_nack(
+                arquivo_socket,
+                seq_esperado,
+                f"Sequencia inesperada. Esperado {seq_esperado}, recebido {seq}.",
+            )
+            continue
+
+        if not _validar_limite_mensagem(mensagem_partes, payload, tamanho_maximo_sessao):
+            enviar_nack(arquivo_socket, seq, f"Mensagem total excede o limite da sessao ({tamanho_maximo_sessao}).")
             continue
 
         mensagem_partes[seq] = payload
         _log_pacote_recebido(seq, payload, pacote)
 
-        if fim:
+        if bool(pacote.get("fim", False)):
             fim_seq = seq
 
-        # ACK CUMULATIVO: ACK(seq) confirma todos os pacotes de 0 até seq inclusive.
-        enviar_json(arquivo_socket, {
-            'tipo': 'ack',
-            'seq': seq,
-            'status': 'ok',
-            'cumulativo': True,
-        })
-        print(f'[SERVIDOR] ACK cumulativo enviado seq={seq} (confirma 0..{seq})')
+        enviar_ack_cumulativo(arquivo_socket, seq)
+        print(f"[SERVIDOR] ACK cumulativo enviado seq={seq} confirma=0..{seq}")
         seq_esperado += 1
 
         if fim_seq is not None and seq_esperado > fim_seq:
-            mensagem_final = ''.join(mensagem_partes[i] for i in range(fim_seq + 1))
-            print('[SERVIDOR] Recebimento da carga util concluido.')
+            mensagem_final = "".join(mensagem_partes[i] for i in range(fim_seq + 1))
+            print("[SERVIDOR] Recebimento da carga util concluido.")
             print(f"[SERVIDOR] Mensagem reconstruida: '{mensagem_final}'")
             return
 
 
-# ---------------------------------------------------------------------------
-# Repetição Seletiva com ACK individual
-# ---------------------------------------------------------------------------
-# Semântica correta do SR:
-#   - O receptor aceita pacotes fora de ordem dentro da janela atual.
-#   - Cada pacote recebido com sucesso recebe ACK individual imediato.
-#   - NACK só é enviado quando há evidência real de lacuna, isto é, quando
-#     chega um pacote com seq maior que seq_esperado.
-#   - O servidor NÃO envia NACK preventivo para o próximo seq após cada ACK,
-#     pois isso gera NACKs indevidos em transmissões sem erro/perda.
-#   - O remetente retransmite apenas os pacotes com NACK (não a janela toda).
-# ---------------------------------------------------------------------------
 def receber_seletivo(
-    arquivo_socket,
-    tamanho_maximo_sessao,
-    janela_sessao,
-    aesgcm=None,
-    hmac_key=None,
-):
+    arquivo_socket: JsonLineSocket,
+    tamanho_maximo_sessao: int,
+    janela_sessao: int,
+    aesgcm: Optional[object] = None,
+    hmac_key: Optional[bytes] = None,
+) -> None:
+    """Repeticao seletiva com ACK individual e buffer fora de ordem."""
+
     mensagem_partes: Dict[int, str] = {}
     fim_seq: Optional[int] = None
     seq_esperado = 0
-    nacks_emitidos: Set[int] = set()
+    nacks_emitidos = set()
 
     while True:
         pacote = receber_json(arquivo_socket)
 
-        # CORREÇÃO: trata encerramento gracioso enviado pelo cliente.
-        if isinstance(pacote, dict) and pacote.get('tipo') == 'fim_sessao':
+        if pacote.get("tipo") == "fim_sessao":
             print(f"[SERVIDOR] Encerramento gracioso recebido: {pacote.get('mensagem', '')}")
-            raise ConnectionError('Cliente encerrou a sessao normalmente.')
+            raise ConnectionError("Cliente encerrou a sessao normalmente.")
 
         seq, payload, erro = validar_pacote_payload(pacote, aesgcm, hmac_key)
-
         if erro:
-            enviar_nack(arquivo_socket, seq if seq is not None else -1, erro)
+            nack_seq = seq if isinstance(seq, int) else seq_esperado
+            enviar_nack(arquivo_socket, nack_seq, erro)
             continue
 
-        fim = bool(pacote.get('fim', False))
+        assert seq is not None
+        assert payload is not None
 
-        # Pacote já confirmado anteriormente: reenvia ACK individual.
         if seq < seq_esperado:
-            enviar_json(arquivo_socket, {'tipo': 'ack', 'seq': seq, 'status': 'ok', 'cumulativo': False})
+            enviar_ack_individual(arquivo_socket, seq)
+            print(f"[SERVIDOR] Duplicado seletivo seq={seq}. ACK individual reenviado.")
             continue
 
-        # Pacote além da janela atual: descarta e pede reenvio do esperado.
         if seq > seq_esperado + janela_sessao - 1:
             enviar_nack(
                 arquivo_socket,
                 seq_esperado,
-                f'Seq fora da janela atual. Esperado entre {seq_esperado} e {seq_esperado + janela_sessao - 1}.',
+                f"Seq fora da janela atual. Esperado entre {seq_esperado} e {seq_esperado + janela_sessao - 1}.",
             )
             continue
 
-        # NACK somente quando existe evidência de lacuna:
-        # se chegou seq maior que o esperado, algum pacote anterior dentro
-        # da janela realmente está faltando. Em fluxo normal 0,1,2,3...,
-        # esta condição nunca ocorre, portanto não há NACK indevido.
         if seq > seq_esperado:
             for faltante in range(seq_esperado, seq):
                 if faltante not in mensagem_partes and faltante not in nacks_emitidos:
-                    enviar_nack(arquivo_socket, faltante, f'Sequencia faltante {faltante}.')
+                    enviar_nack(arquivo_socket, faltante, f"Sequencia faltante {faltante}.")
                     nacks_emitidos.add(faltante)
 
         if seq not in mensagem_partes:
-            tamanho_novo = sum(len(v) for v in mensagem_partes.values()) + len(payload)
-            if tamanho_novo > tamanho_maximo_sessao:
-                enviar_nack(arquivo_socket, seq, f'Mensagem total excede o limite da sessao ({tamanho_maximo_sessao}).')
+            if not _validar_limite_mensagem(mensagem_partes, payload, tamanho_maximo_sessao):
+                enviar_nack(arquivo_socket, seq, f"Mensagem total excede o limite da sessao ({tamanho_maximo_sessao}).")
                 continue
+
             mensagem_partes[seq] = payload
             _log_pacote_recebido(seq, payload, pacote)
-            # BUG CORRIGIDO: fim_seq só é definido quando o pacote é armazenado
-            # pela primeira vez. Colocá-lo fora deste bloco permitia que uma
-            # retransmissão (seq já em mensagem_partes) sobrescrevesse fim_seq,
-            # podendo reativar uma condição de término já processada.
-            if fim and fim_seq is None:
+            if bool(pacote.get("fim", False)) and fim_seq is None:
                 fim_seq = seq
 
-        # ACK individual: confirma apenas este seq específico.
-        enviar_json(arquivo_socket, {'tipo': 'ack', 'seq': seq, 'status': 'ok', 'cumulativo': False})
-        print(f'[SERVIDOR] ACK individual enviado seq={seq}')
+        enviar_ack_individual(arquivo_socket, seq)
+        print(f"[SERVIDOR] ACK individual enviado seq={seq}")
 
         seq_esperado_anterior = seq_esperado
         while seq_esperado in mensagem_partes:
             seq_esperado += 1
 
         if seq_esperado > seq_esperado_anterior:
-            # Remove NACKs já emitidos para seqs que foram confirmados.
             nacks_emitidos = {s for s in nacks_emitidos if s >= seq_esperado}
 
         if fim_seq is not None and seq_esperado > fim_seq:
-            mensagem_final = ''.join(mensagem_partes[i] for i in range(fim_seq + 1))
-            print('[SERVIDOR] Recebimento da carga util concluido.')
+            mensagem_final = "".join(mensagem_partes[i] for i in range(fim_seq + 1))
+            print("[SERVIDOR] Recebimento da carga util concluido.")
             print(f"[SERVIDOR] Mensagem reconstruida: '{mensagem_final}'")
             return
 
 
 def receber_payload_com_ack(
-    arquivo_socket,
-    tamanho_maximo_sessao,
-    janela_sessao,
-    tipo_operacao,
-    modo_confirmacao,
-    aesgcm=None,
-    hmac_key=None,
-):
-    # Modo individual é um caso especial de GBN com janela=1:
-    # sempre em ordem, sem buffer fora de ordem, ACK cumulativo trivial.
-    if tipo_operacao == 'individual' or modo_confirmacao == 'go_back_n':
+    arquivo_socket: JsonLineSocket,
+    tamanho_maximo_sessao: int,
+    janela_sessao: int,
+    tipo_operacao: str,
+    modo_confirmacao: str,
+    aesgcm: Optional[object] = None,
+    hmac_key: Optional[bytes] = None,
+) -> None:
+    if tipo_operacao == "individual" or modo_confirmacao == "go_back_n":
         receber_gbn(
             arquivo_socket,
             tamanho_maximo_sessao,
-            janela_sessao if tipo_operacao != 'individual' else 1,
+            1 if tipo_operacao == "individual" else janela_sessao,
             aesgcm=aesgcm,
             hmac_key=hmac_key,
         )
@@ -464,186 +574,176 @@ def receber_payload_com_ack(
         )
 
 
-def main():
+def handle_client(conn: socket.socket, addr: object, args: argparse.Namespace, janela_inicial: int) -> None:
+    try:
+        with conn:
+            print(f"[SERVIDOR] Conectado por {addr}")
+            conn.settimeout(HANDSHAKE_TIMEOUT)
+            arquivo_socket = JsonLineSocket(conn, str(addr))
+
+            try:
+                client_config = receber_json(arquivo_socket)
+            except socket.timeout:
+                print(f"[SERVIDOR] Timeout ({HANDSHAKE_TIMEOUT}s) aguardando handshake de {addr}.")
+                try:
+                    enviar_json(
+                        arquivo_socket,
+                        {
+                            "tipo": "handshake_ack",
+                            "status": "erro",
+                            "mensagem": "Timeout aguardando handshake.",
+                        },
+                    )
+                except Exception:
+                    pass
+                return
+            except (json.JSONDecodeError, ValueError, ConnectionError) as erro:
+                print(f"[SERVIDOR] Erro ao receber handshake: {erro}")
+                try:
+                    enviar_json(
+                        arquivo_socket,
+                        {
+                            "tipo": "handshake_ack",
+                            "status": "erro",
+                            "mensagem": "Handshake invalido ou conexao fechada.",
+                        },
+                    )
+                except Exception:
+                    pass
+                return
+
+            print("[SERVIDOR] Handshake recebido do cliente:")
+            print(f"  - Modo de operacao: {client_config.get('modo_operacao', 'nao informado')}")
+            print(f"  - Tamanho maximo desejado: {client_config.get('tamanho_maximo_desejado', 'nao informado')} caracteres")
+            print(f"  - Janela desejada pelo cliente: {client_config.get('janela_desejada', 'nao informado')}")
+            print(f"  - Tipo de operacao: {client_config.get('tipo_operacao', 'nao informado')}")
+            print(f"  - Modo de confirmacao: {client_config.get('modo_confirmacao', args.modo_confirmacao_padrao)}")
+            print(f"  - Criptografia desejada: {client_config.get('criptografia_desejada', True)}")
+
+            valido, mensagem_validacao = validar_handshake(client_config, args.modo_confirmacao_padrao)
+            if not valido:
+                enviar_json(
+                    arquivo_socket,
+                    {"tipo": "handshake_ack", "status": "erro", "mensagem": mensagem_validacao},
+                )
+                print(f"[SERVIDOR] Handshake rejeitado: {mensagem_validacao}")
+                return
+
+            timeout_ack_ms = int(client_config.get("timeout_ack_ms", DEFAULT_TIMEOUT_ACK_MS))
+            max_retransmissoes = int(client_config.get("max_retransmissoes", DEFAULT_MAX_RETRANSMISSOES))
+            timeout_dados = max(2.0, (timeout_ack_ms / 1000.0) * (max_retransmissoes + 2))
+            conn.settimeout(timeout_dados)
+
+            tamanho_maximo_sessao = min(int(client_config["tamanho_maximo_desejado"]), SERVER_BUFFER_SIZE)
+            janela_sessao = janela_inicial
+            if not (MIN_JANELA <= janela_sessao <= MAX_JANELA):
+                enviar_json(
+                    arquivo_socket,
+                    {
+                        "tipo": "handshake_ack",
+                        "status": "erro",
+                        "mensagem": "Janela do servidor fora do intervalo permitido.",
+                    },
+                )
+                return
+
+            criptografia_ativa = bool(client_config.get("criptografia_desejada", True))
+            aesgcm: Optional[object] = None
+            hmac_key: Optional[bytes] = None
+            session_salt: Optional[bytes] = None
+
+            if criptografia_ativa:
+                session_salt = os.urandom(16)
+                aesgcm, hmac_key = derive_session_keys(session_salt)
+
+            modo_confirmacao = client_config.get("modo_confirmacao", args.modo_confirmacao_padrao)
+            tipo_operacao = client_config.get("tipo_operacao", "lotes")
+
+            server_config = {
+                "tipo": "handshake_ack",
+                "status": "ok",
+                "modo_operacao": "servidor",
+                "tamanho_maximo_sessao": tamanho_maximo_sessao,
+                "janela_sessao": janela_sessao,
+                "criptografia_ativa": criptografia_ativa,
+                "modo_confirmacao_acordado": modo_confirmacao,
+                "timeout_ack_ms_acordado": timeout_ack_ms,
+                "max_retransmissoes_acordado": max_retransmissoes,
+            }
+            if session_salt is not None:
+                server_config["session_salt"] = base64.b64encode(session_salt).decode("ascii")
+
+            enviar_json(arquivo_socket, server_config)
+
+            print("[SERVIDOR] Handshake enviado:")
+            print(f"  - Modo de operacao: {server_config['modo_operacao']}")
+            print(f"  - Tamanho maximo da sessao: {tamanho_maximo_sessao} caracteres")
+            print(f"  - Janela da sessao definida pelo servidor: {janela_sessao}")
+            print(f"  - Cliente sugeriu janela: {client_config.get('janela_desejada')}")
+            print(f"  - Modo de confirmacao acordado: {modo_confirmacao}")
+            print(f"  - Tipo de operacao: {tipo_operacao}")
+            print(f"  - Timeout de dados: {timeout_dados:.2f}s")
+            print(f"  - Criptografia ativa: {criptografia_ativa}")
+            print("[SERVIDOR] Handshake completo!")
+
+            while True:
+                try:
+                    receber_payload_com_ack(
+                        arquivo_socket,
+                        tamanho_maximo_sessao,
+                        janela_sessao,
+                        tipo_operacao,
+                        modo_confirmacao,
+                        aesgcm=aesgcm,
+                        hmac_key=hmac_key,
+                    )
+                except socket.timeout:
+                    print("[SERVIDOR] Timeout de inatividade no fluxo de dados. Notificando cliente...")
+                    enviar_mensagem_encerramento_servidor(arquivo_socket, addr)
+                    print("[SERVIDOR] Encerrando conexao.")
+                    break
+                except ConnectionError as erro:
+                    print(f"[SERVIDOR] Conexao encerrada: {erro}")
+                    break
+                except json.JSONDecodeError as erro:
+                    print(f"[SERVIDOR] Erro de decodificacao JSON: {erro}")
+                    break
+                except ValueError as erro:
+                    print(f"[SERVIDOR] Erro de protocolo: {erro}")
+                    break
+
+    except OSError as erro:
+        print(f"[SERVIDOR] Conexao com {addr} encerrada com erro de socket: {erro}")
+    except Exception as erro:  # pragma: no cover - protege thread do servidor
+        print(f"[SERVIDOR] Erro inesperado com {addr}: {erro}")
+
+
+def main() -> None:
     args = parse_args()
     host, port = obter_host_port(args)
-
-    # Valida e normaliza a janela inicial configurada no servidor.
-    janela_inicial = max(MIN_JANELA, min(MAX_JANELA, args.janela_inicial))
-
-    def handle_client(conn, addr):
-        try:
-            with conn:
-                print(f'[SERVIDOR] Conectado por {addr}')
-                conn.settimeout(HANDSHAKE_TIMEOUT)
-
-                # CORREÇÃO: uso de makefile separado para leitura e escrita
-                # evita possíveis deadlocks em ambientes onde readline() bloqueante
-                # pode conflitar com o buffer de escrita do mesmo descritor.
-                with conn.makefile('rb') as arq_leitura, conn.makefile('wb') as arq_escrita:
-
-                    class ArquivoDuplex:
-                        """Wrapper que separa leitura e escrita em dois makefile distintos."""
-                        def readline(self):
-                            return arq_leitura.readline()
-
-                        def write(self, data):
-                            return arq_escrita.write(data)
-
-                        def flush(self):
-                            return arq_escrita.flush()
-
-                    arquivo_socket = ArquivoDuplex()
-
-                    try:
-                        client_config = receber_json(arquivo_socket)
-                    except socket.timeout:
-                        print(
-                            f'[SERVIDOR] Timeout ({HANDSHAKE_TIMEOUT}s) aguardando handshake de {addr}. '
-                            'Encerrando conexao.'
-                        )
-                        try:
-                            enviar_json(
-                                arquivo_socket,
-                                {
-                                    'tipo': 'handshake_ack',
-                                    'status': 'erro',
-                                    'mensagem': 'Timeout aguardando handshake.',
-                                },
-                            )
-                        except Exception:
-                            pass
-                        return
-                    except (json.JSONDecodeError, ConnectionError) as erro:
-                        print(f'[SERVIDOR] Erro ao receber handshake: {erro}')
-                        try:
-                            enviar_json(
-                                arquivo_socket,
-                                {
-                                    'tipo': 'handshake_ack',
-                                    'status': 'erro',
-                                    'mensagem': 'Handshake invalido ou conexao fechada.',
-                                },
-                            )
-                        except Exception:
-                            pass
-                        return
-
-                    tipo_operacao = client_config.get('tipo_operacao', 'nao informado')
-                    modo_confirmacao_cliente = client_config.get('modo_confirmacao', args.modo_confirmacao_padrao)
-
-                    print('[SERVIDOR] Handshake recebido do cliente:')
-                    print(f"  - Modo de operacao: {client_config.get('modo_operacao', 'nao informado')}")
-                    print(f"  - Tamanho maximo desejado: {client_config.get('tamanho_maximo_desejado', 'nao informado')} caracteres")
-                    print(f"  - Janela desejada pelo cliente: {client_config.get('janela_desejada', 'nao informado')}")
-                    print(f'  - Tipo de operacao: {tipo_operacao}')
-                    print(f'  - Modo de confirmacao: {modo_confirmacao_cliente}')
-
-                    valido, mensagem_validacao = validar_handshake(client_config, args.modo_confirmacao_padrao)
-                    if not valido:
-                        enviar_json(arquivo_socket, {'tipo': 'handshake_ack', 'status': 'erro', 'mensagem': mensagem_validacao})
-                        print(f'[SERVIDOR] Handshake rejeitado: {mensagem_validacao}')
-                        return
-
-                    session_salt = os.urandom(16)
-                    aesgcm, hmac_key = derive_session_keys(session_salt)
-
-                    modo_confirmacao = client_config.get('modo_confirmacao', args.modo_confirmacao_padrao)
-                    timeout_ack_ms = int(client_config.get('timeout_ack_ms', DEFAULT_TIMEOUT_ACK_MS))
-                    max_retransmissoes = int(client_config.get('max_retransmissoes', DEFAULT_MAX_RETRANSMISSOES))
-
-                    # Calcula o timeout adequado para a fase de dados.
-                    # Se o settimeout falhar (raro), define um fallback seguro
-                    # em vez de silenciar o erro e ficar com HANDSHAKE_TIMEOUT.
-                    timeout_dados = max(2.0, (timeout_ack_ms / 1000.0) * (max_retransmissoes + 2))
-                    try:
-                        conn.settimeout(timeout_dados)
-                    except OSError as e:
-                        print(f'[SERVIDOR] Aviso: nao foi possivel ajustar timeout para {timeout_dados:.1f}s: {e}')
-                        # Fallback: usa timeout_dados diretamente na leitura via
-                        # socket.settimeout de novo com valor mínimo seguro.
-                        try:
-                            conn.settimeout(max(timeout_dados, HANDSHAKE_TIMEOUT + 1))
-                        except OSError:
-                            pass
-
-                    tamanho_maximo_sessao = min(client_config['tamanho_maximo_desejado'], SERVER_BUFFER_SIZE)
-
-                    # ----------------------------------------------------------
-                    # JANELA CONTROLADA PELO SERVIDOR
-                    # O servidor determina o tamanho da janela da sessão.
-                    # O cliente pode sugerir via janela_desejada, mas a
-                    # decisão final é sempre do servidor.
-                    # ----------------------------------------------------------
-                    janela_sessao = janela_inicial
-                    print(
-                        f'[SERVIDOR] Janela da sessao definida pelo servidor: {janela_sessao} '
-                        f'(cliente sugeriu: {client_config.get("janela_desejada", "?")})'
-                    )
-
-                    server_config = {
-                        'tipo': 'handshake_ack',
-                        'status': 'ok',
-                        'modo_operacao': 'servidor',
-                        'tamanho_maximo_sessao': tamanho_maximo_sessao,
-                        'janela_sessao': janela_sessao,
-                        'session_salt': base64.b64encode(session_salt).decode('ascii'),
-                        'modo_confirmacao_acordado': modo_confirmacao,
-                        'timeout_ack_ms_acordado': timeout_ack_ms,
-                        'max_retransmissoes_acordado': max_retransmissoes,
-                    }
-                    enviar_json(arquivo_socket, server_config)
-
-                    print('[SERVIDOR] Handshake enviado:')
-                    print(f"  - Modo de operacao: {server_config['modo_operacao']}")
-                    print(f"  - Tamanho maximo da sessao: {server_config['tamanho_maximo_sessao']} caracteres")
-                    print(f"  - Janela da sessao (definida pelo servidor): {server_config['janela_sessao']}")
-                    print(f"  - Modo de confirmacao acordado: {server_config['modo_confirmacao_acordado']}")
-                    print('[SERVIDOR] Handshake completo!')
-
-                    while True:
-                        try:
-                            receber_payload_com_ack(
-                                arquivo_socket,
-                                tamanho_maximo_sessao,
-                                janela_sessao,
-                                client_config.get('tipo_operacao', 'lotes'),
-                                modo_confirmacao,
-                                aesgcm=aesgcm,
-                                hmac_key=hmac_key,
-                            )
-                        except socket.timeout:
-                            # CORREÇÃO: envia notificação ao cliente antes de encerrar,
-                            # evitando que o cliente fique bloqueado esperando ACK.
-                            print('[SERVIDOR] Timeout de inatividade no fluxo de dados. Notificando cliente...')
-                            enviar_mensagem_encerramento_servidor(arquivo_socket, addr)
-                            print('[SERVIDOR] Encerrando conexao.')
-                            break
-                        except ConnectionError as e:
-                            print(f'[SERVIDOR] Conexao encerrada: {e}')
-                            break
-                        except json.JSONDecodeError as erro:
-                            print(f'[SERVIDOR] Erro de decodificacao JSON: {erro}')
-                            break
-
-        except OSError as erro:
-            print(f'[SERVIDOR] Conexao com {addr} encerrada com erro de socket: {erro}')
+    janela_inicial = max(MIN_JANELA, min(MAX_JANELA, int(args.janela_inicial)))
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind((host, port))
         server_socket.listen()
 
-        print(f'[SERVIDOR] Aguardando conexoes em {host}:{port}...')
-        print(f'[SERVIDOR] Janela inicial configurada: {janela_inicial}')
+        print(f"[SERVIDOR] Aguardando conexoes em {host}:{port}...")
+        print(f"[SERVIDOR] Janela inicial configurada pelo servidor: {janela_inicial}")
+        print("[SERVIDOR] Pressione Ctrl+C para encerrar.")
+
         try:
             while True:
                 conn, addr = server_socket.accept()
-                t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
-                t.start()
+                thread = threading.Thread(
+                    target=handle_client,
+                    args=(conn, addr, args, janela_inicial),
+                    daemon=True,
+                )
+                thread.start()
         except KeyboardInterrupt:
-            print('\n[SERVIDOR] Encerrado por Ctrl + C.')
+            print("\n[SERVIDOR] Encerrado por Ctrl+C.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
