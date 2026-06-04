@@ -1,176 +1,158 @@
-# Trabalho I - Transporte Confiavel na Camada de Aplicacao
+# Trabalho de Redes 2026.1
 
-## 1. Visao geral
+Projeto cliente-servidor em Python usando sockets TCP, handshake em JSON,
+fragmentacao de mensagens, controle de janela, ACK/NACK, Go-Back-N,
+Repeticao Seletiva, integridade por HMAC e criptografia AES-GCM.
 
-Este projeto implementa uma aplicacao cliente-servidor em Python capaz de fornecer, na camada de aplicacao, um transporte confiavel de dados sobre sockets TCP. Embora o TCP ja seja confiavel, o objetivo do trabalho e implementar e demonstrar explicitamente os mecanismos classicos de transporte confiavel no nivel da aplicacao.
+## Objetivo
 
-A implementacao inclui:
+Implementar uma aplicacao cliente-servidor que permita o envio de texto do
+cliente para o servidor com negociacao inicial de parametros, fragmentacao em
+pacotes de ate 4 caracteres, confirmacao por ACK/NACK, retransmissao em caso de
+falha e suporte a multiplos clientes simultaneos.
 
-- conexao cliente-servidor por socket, via `localhost` ou IP;
-- protocolo de aplicacao proprio usando mensagens JSON delimitadas por quebra de linha;
-- handshake inicial com negociacao de parametros da sessao;
-- limite maximo de caracteres por mensagem, definido no inicio da comunicacao, com minimo de 30;
-- fragmentacao da mensagem em pacotes de aplicacao com carga util maxima de 4 caracteres;
-- numero de sequencia em todos os pacotes;
-- checksum CRC32 em todos os pacotes;
-- ACK positivo;
-- NACK negativo;
-- temporizador e retransmissao no cliente;
-- janela/paralelismo, com tamanho entre 1 e 5, determinado pelo servidor e valor inicial padrao 5;
-- envio individual, equivalente a Stop-and-Wait;
-- envio em lotes com Go-Back-N ou repeticao seletiva;
-- simulacao deterministica de perdas no lado cliente;
-- simulacao deterministica de falhas de integridade no lado cliente;
-- criptografia simetrica opcional com AES-GCM;
-- derivacao de chaves por HKDF a partir de uma PSK;
-- HMAC-SHA256 para autenticacao dos dados criptografados principais;
-- logs dos metadados dos pacotes no servidor;
-- logs dos metadados das confirmacoes no cliente;
-- encerramento gracioso de sessao.
+## Autoria
 
-Arquivos entregues:
+- Autor: Henrique Sergio
+- Disciplina: Redes de Computadores
+- Periodo: 2026.1
+
+## Tecnologias utilizadas
+
+- Python 3.8 ou superior
+- Sockets TCP (`socket.AF_INET`, `socket.SOCK_STREAM`)
+- JSON em UTF-8 com delimitacao por quebra de linha
+- Threads para atendimento concorrente no servidor
+- AES-256-GCM para confidencialidade/autenticidade do payload
+- HMAC-SHA256 para integridade explicita dos pacotes
+- HKDF-SHA256 para derivacao de chaves de sessao a partir de PSK
+
+## Estrutura do projeto
 
 ```text
-server.py
-client.py
-readme.md
+.
+|-- client.py
+|-- server.py
+|-- protocol.py
+|-- requirements.txt
+|-- README.md
+|-- docs/
+|   |-- matriz_requisitos.md
+|   |-- relatorio.md
+|   `-- evidencias_testes.md
+`-- tests/
+    `-- test_protocol.py
 ```
 
----
+## Dependencias
 
-## 2. Dependencias
-
-Versao recomendada:
+Instale as dependencias com:
 
 ```bash
-python --version
+python -m pip install -r requirements.txt
 ```
 
-Recomendado: Python 3.10 ou superior.
+Conteudo esperado do `requirements.txt`:
 
-Instale a dependencia de criptografia:
-
-```bash
-pip install cryptography
+```text
+cryptography>=42.0.0
 ```
 
-A biblioteca `cryptography` e necessaria quando a sessao usa AES-GCM/HMAC, que e o modo padrao. Para executar sem criptografia, use a flag `--sem-criptografia` no cliente.
+## Configuracao obrigatoria da PSK
 
----
-
-## 3. Configuracao da chave pre-compartilhada
-
-O cliente e o servidor derivam as chaves de sessao a partir de uma PSK definida na variavel de ambiente `PSK`.
+Por padrao, cliente e servidor exigem a variavel de ambiente `PSK`. Ela deve ter
+o mesmo valor nos dois processos.
 
 Linux/macOS:
 
 ```bash
-export PSK='chave_secreta_do_grupo'
+export PSK='chave_compartilhada_forte_para_o_trabalho'
 ```
 
-Windows PowerShell:
+PowerShell:
 
 ```powershell
-$env:PSK='chave_secreta_do_grupo'
+$env:PSK = 'chave_compartilhada_forte_para_o_trabalho'
 ```
 
-Se a variavel `PSK` nao for definida, o codigo usa uma chave de desenvolvimento insegura apenas para testes locais. Para apresentacao e entrega, recomenda-se definir `PSK` nos dois terminais antes de executar cliente e servidor.
-
----
-
-## 4. Como executar
-
-Abra dois terminais: um para o servidor e outro para o cliente.
-
-### 4.1. Servidor
-
-Execucao padrao em `127.0.0.1:5000`:
+Para testes locais rapidos, e possivel usar explicitamente a PSK de
+desenvolvimento insegura:
 
 ```bash
-python server.py
+python server.py --allow-insecure-dev-psk
+python client.py --allow-insecure-dev-psk
 ```
 
-Execucao especificando host e porta:
+Essa opcao nao deve ser usada como configuracao principal de entrega.
+
+## Como executar
+
+### 1. Iniciar o servidor
 
 ```bash
 python server.py --host 127.0.0.1 --port 5000
 ```
 
-Executar aceitando conexoes por IP da maquina na rede local:
+Opcionalmente, escolha o modo padrao de confirmacao e a janela do servidor:
 
 ```bash
-python server.py --host 0.0.0.0 --port 5000
+python server.py --host 127.0.0.1 --port 5000 --modo-confirmacao-padrao go_back_n --janela-inicial 5
 ```
 
-Definir a janela inicial do servidor:
-
-```bash
-python server.py --host 127.0.0.1 --port 5000 --janela-inicial 5
-```
-
-A janela sempre e definida pelo servidor, fica limitada ao intervalo `1..5` e tem valor padrao inicial `5`.
-
-### 4.2. Cliente
-
-Execucao padrao:
-
-```bash
-python client.py
-```
-
-Execucao especificando host e porta:
+### 2. Iniciar o cliente
 
 ```bash
 python client.py --host 127.0.0.1 --port 5000
 ```
 
-Usar Go-Back-N:
+O cliente solicitara:
+
+1. tamanho maximo desejado da sessao, com valor minimo 30;
+2. janela desejada, entre 1 e 5;
+3. tipo de operacao: `individual` ou `lotes`;
+4. mensagens a enviar;
+5. comando `sair` para encerrar.
+
+## Execucao automatizada
+
+Exemplo com Go-Back-N:
 
 ```bash
-python client.py --host 127.0.0.1 --port 5000 --modo-confirmacao go_back_n
+printf '2048\n5\n2\nmensagem de teste\nsair\n' | python client.py --host 127.0.0.1 --port 5000 --modo-confirmacao go_back_n
 ```
 
-Usar repeticao seletiva:
+Exemplo com Repeticao Seletiva:
 
 ```bash
-python client.py --host 127.0.0.1 --port 5000 --modo-confirmacao seletivo
+printf '2048\n5\n2\nmensagem de teste\nsair\n' | python client.py --host 127.0.0.1 --port 5000 --modo-confirmacao seletivo
 ```
 
-Desativar criptografia para demonstrar payload/checksum em claro:
+Exemplo com modo individual:
 
 ```bash
-python client.py --host 127.0.0.1 --port 5000 --sem-criptografia
+printf '2048\n1\n1\nmensagem de teste\nsair\n' | python client.py --host 127.0.0.1 --port 5000
 ```
 
----
+## Simulacao de falhas
 
-## 5. Entradas interativas do cliente
+Perda controlada de pacotes:
 
-Ao iniciar, o cliente solicita:
-
-1. `tamanho_maximo_desejado`: limite maximo de caracteres por mensagem. Deve ser maior ou igual a 30.
-2. `janela_desejada`: sugestao de tamanho de janela entre 1 e 5. O servidor pode ignorar essa sugestao e determina a janela efetiva da sessao.
-3. `tipo_operacao`:
-   - `1`: individual, equivalente a Stop-and-Wait;
-   - `2`: lotes, com janela.
-
-Depois do handshake, o cliente solicita mensagens de texto. Para encerrar a sessao, digite:
-
-```text
-sair
+```bash
+printf '2048\n5\n2\nmensagem de teste\nsair\n' | python client.py --drop-seqs 1
 ```
 
----
+Corrupcao controlada de pacotes:
 
-## 6. Protocolo de aplicacao
+```bash
+printf '2048\n5\n2\nmensagem de teste\nsair\n' | python client.py --corrupt-seqs 2
+```
 
-A comunicacao usa JSON por linha. Cada mensagem JSON termina com `\n`.
+A corrupcao altera um campo sensivel a integridade. Em pacotes criptografados,
+o HMAC e modificado, forscando NACK do servidor.
 
-O codigo nao usa `socket.makefile().readline()`; ele usa `socket.recv()` com buffer proprio. Isso evita falhas apos `socket.timeout` e permite retransmissao correta apos perdas simuladas.
+## Protocolo
 
-### 6.1. Handshake do cliente
-
-Exemplo conceitual:
+### Handshake do cliente
 
 ```json
 {
@@ -182,17 +164,11 @@ Exemplo conceitual:
   "tipo_operacao": "lotes",
   "modo_confirmacao": "go_back_n",
   "timeout_ack_ms": 5000,
-  "max_retransmissoes": 3,
-  "criptografia_desejada": true,
-  "simulacao_perda_seq": [2],
-  "simulacao_corrupcao_seq": [],
-  "simulacao_corrupcao_checksum_seq": []
+  "max_retransmissoes": 3
 }
 ```
 
-### 6.2. Resposta de handshake do servidor
-
-Exemplo conceitual:
+### Handshake do servidor
 
 ```json
 {
@@ -201,7 +177,6 @@ Exemplo conceitual:
   "modo_operacao": "servidor",
   "tamanho_maximo_sessao": 2048,
   "janela_sessao": 5,
-  "criptografia_ativa": true,
   "session_salt": "...",
   "modo_confirmacao_acordado": "go_back_n",
   "timeout_ack_ms_acordado": 5000,
@@ -209,394 +184,111 @@ Exemplo conceitual:
 }
 ```
 
-### 6.3. Pacote de dados sem criptografia
+### Pacote de dados
 
 ```json
 {
   "tipo": "dados",
+  "message_id": 0,
   "seq": 0,
   "fim": false,
-  "checksum": "ed82cd11",
-  "payload": "abcd"
-}
-```
-
-### 6.4. Pacote de dados com criptografia
-
-```json
-{
-  "tipo": "dados",
-  "seq": 0,
-  "fim": false,
-  "checksum": "ed82cd11",
-  "ciphertext": "...",
   "nonce": "...",
+  "ciphertext": "...",
   "hmac": "..."
 }
 ```
 
-Observacao: o checksum e calculado sobre o texto original de cada fragmento. Em sessoes criptografadas, o servidor descriptografa o fragmento e valida o checksum. O HMAC autentica os metadados criptografados principais (`seq`, `fim`, `nonce` e `ciphertext`).
+O campo `message_id` evita que retransmissoes antigas sejam confundidas com uma
+nova mensagem quando `seq` reinicia em zero.
 
-### 6.5. ACK
-
-ACK cumulativo usado no Go-Back-N:
-
-```json
-{
-  "tipo": "ack",
-  "seq": 4,
-  "status": "ok",
-  "cumulativo": true,
-  "mensagem": "Recebido com sucesso."
-}
-```
-
-ACK individual usado na repeticao seletiva:
+### ACK
 
 ```json
 {
   "tipo": "ack",
-  "seq": 4,
+  "message_id": 0,
+  "seq": 0,
   "status": "ok",
-  "cumulativo": false,
-  "mensagem": "Recebido com sucesso."
+  "cumulativo": true
 }
 ```
 
-### 6.6. NACK
+### NACK
 
 ```json
 {
   "tipo": "nack",
-  "seq": 2,
+  "message_id": 0,
+  "seq": 1,
   "status": "reenviar",
-  "mensagem": "Sequencia faltante 2."
+  "mensagem": "Sequencia faltante 1."
 }
 ```
 
-### 6.7. Encerramento gracioso
+## Regras implementadas
 
-```json
-{
-  "tipo": "fim_sessao",
-  "mensagem": "Cliente encerrando sessao normalmente."
-}
-```
+- Aplicacao cliente-servidor usando TCP.
+- Handshake inicial em JSON.
+- Validacao estrita de versao, modo, tamanho, janela, timeout e retransmissoes.
+- Tamanho minimo de sessao: 30 caracteres.
+- Limite local do servidor: 4096 caracteres.
+- Janela de sessao entre 1 e 5, definida pelo servidor.
+- Fragmentacao da carga util em pacotes de ate 4 caracteres.
+- Campo `seq` validado como inteiro nao negativo de 32 bits.
+- Campo `message_id` validado como inteiro nao negativo de 64 bits.
+- Criptografia AES-GCM com salt por sessao.
+- HMAC-SHA256 cobrindo `nonce`, `ciphertext`, `message_id` e `seq`.
+- ACK cumulativo em Go-Back-N.
+- ACK individual em Repeticao Seletiva.
+- NACK para pacote invalido, fora de ordem ou ausente.
+- Timeout de handshake no servidor.
+- Timeout de ACK no cliente.
+- Retransmissao com limite configuravel.
+- Encerramento gracioso com `fim_sessao`.
+- Multiplos clientes por threads.
 
----
+## Testes automatizados
 
-## 7. Funcionamento dos modos
-
-### 7.1. Envio individual
-
-No modo individual, o cliente envia um pacote e aguarda ACK/NACK antes de enviar o proximo. Esse modo equivale a Stop-and-Wait.
-
-Mesmo que o servidor tenha definido janela 5, o envio individual usa janela efetiva 1 para a troca de dados.
-
-### 7.2. Go-Back-N
-
-No modo Go-Back-N:
-
-- o cliente envia uma janela de pacotes;
-- o servidor aceita apenas o proximo numero de sequencia esperado;
-- pacotes fora de ordem sao descartados;
-- ACKs sao cumulativos;
-- `ACK(N)` significa que todos os pacotes ate `N` foram recebidos;
-- quando o cliente recebe `NACK(K)`, retransmite de `K` ate o final da janela atual;
-- ACKs/NACKs antigos sao ignorados pelo cliente;
-- NACKs duplicados para a mesma base, gerados por pacotes fora de ordem ja descartados, nao consomem novas tentativas de retransmissao;
-- pacotes duplicados antigos fazem o servidor reenviar o ultimo ACK cumulativo, nao NACK.
-
-### 7.3. Repeticao seletiva
-
-No modo de repeticao seletiva:
-
-- o cliente envia uma janela de pacotes;
-- o servidor aceita pacotes fora de ordem dentro da janela atual;
-- cada pacote correto recebe ACK individual;
-- lacunas geram NACK para o pacote faltante;
-- o cliente retransmite somente o pacote indicado pelo NACK;
-- em caso de timeout, o cliente retransmite apenas pacotes ainda pendentes.
-
----
-
-## 8. Simulacao de erros e perdas
-
-As simulacoes sao definidas no lado cliente e sao deterministicas. Cada sequencia informada e afetada apenas uma vez. Na retransmissao seguinte, o pacote e enviado corretamente.
-
-### 8.1. Simular perda
+Execute:
 
 ```bash
-python client.py --host 127.0.0.1 --port 5000 --drop-seqs 2
+python -m unittest discover -s tests
 ```
 
-Exemplo com mais de uma sequencia:
-
-```bash
-python client.py --host 127.0.0.1 --port 5000 --drop-seqs 1,4,7
-```
-
-### 8.2. Simular corrupcao de HMAC/payload
-
-Em sessao criptografada, `--corrupt-seqs` altera o HMAC. Em sessao sem criptografia, altera o payload em claro.
-
-```bash
-python client.py --host 127.0.0.1 --port 5000 --corrupt-seqs 2
-```
-
-### 8.3. Simular corrupcao de checksum
-
-```bash
-python client.py --host 127.0.0.1 --port 5000 --corrupt-checksum-seqs 2
-```
-
-### 8.4. Configurar temporizador e retransmissoes
-
-```bash
-python client.py --host 127.0.0.1 --port 5000 --timeout-ack-ms 1500 --max-retransmissoes 5
-```
-
----
-
-## 9. Roteiro de demonstracao dos requisitos
-
-Antes de cada teste, inicie o servidor:
-
-```bash
-python server.py --host 127.0.0.1 --port 5000
-```
-
-Em cada execucao do cliente, use as entradas interativas abaixo quando solicitado:
-
-```text
-2048
-5
-2
-abcdefghijklmnopqrstuvwxyz
-sair
-```
-
-A terceira linha (`2`) seleciona envio em lotes.
-
-### 9.1. Handshake e envio sem erro - Go-Back-N
-
-```bash
-python client.py --host 127.0.0.1 --port 5000 --modo-confirmacao go_back_n
-```
-
-Deve aparecer:
-
-- handshake completo nos dois lados;
-- janela definida pelo servidor;
-- pacotes com `seq`, `fim`, `checksum` e metadados de criptografia;
-- ACK cumulativo no cliente;
-- mensagem reconstruida corretamente no servidor.
-
-### 9.2. Perda no meio da janela - Go-Back-N
-
-```bash
-python client.py --host 127.0.0.1 --port 5000 --modo-confirmacao go_back_n --drop-seqs 2 --timeout-ack-ms 1500 --max-retransmissoes 5
-```
-
-Deve aparecer:
-
-- simulacao de perda do pacote `seq=2`;
-- NACK do servidor;
-- retransmissao de `2..fim_janela`;
-- mensagem final reconstruida corretamente.
-
-### 9.2.1. Perda no primeiro pacote da janela - Go-Back-N
-
-```bash
-python client.py --host 127.0.0.1 --port 5000 --modo-confirmacao go_back_n --drop-seqs 0 --timeout-ack-ms 1500 --max-retransmissoes 5
-```
-
-Deve aparecer:
-
-- simulacao de perda do pacote `seq=0`;
-- NACK do servidor para `seq=0`;
-- retransmissao de `0..fim_janela`;
-- NACKs duplicados obsoletos ignorados pelo cliente, sem consumo indevido de tentativas;
-- mensagem final reconstruida corretamente.
-
-### 9.3. Perda do ultimo pacote - Go-Back-N
-
-```bash
-python client.py --host 127.0.0.1 --port 5000 --modo-confirmacao go_back_n --drop-seqs 6 --timeout-ack-ms 1500 --max-retransmissoes 5
-```
-
-Esse teste demonstra o temporizador. Deve ocorrer timeout no cliente, retransmissao e reconstrucao correta da mensagem.
-
-### 9.4. Corrupcao de HMAC - Go-Back-N
-
-```bash
-python client.py --host 127.0.0.1 --port 5000 --modo-confirmacao go_back_n --corrupt-seqs 2 --timeout-ack-ms 1500 --max-retransmissoes 5
-```
-
-O servidor deve detectar falha de HMAC, enviar NACK e receber corretamente a retransmissao.
-
-### 9.5. Corrupcao de checksum - Go-Back-N
-
-```bash
-python client.py --host 127.0.0.1 --port 5000 --modo-confirmacao go_back_n --corrupt-checksum-seqs 2 --timeout-ack-ms 1500 --max-retransmissoes 5
-```
-
-O servidor deve detectar falha de checksum, enviar NACK e receber corretamente a retransmissao.
-
-### 9.6. Repeticao seletiva sem erro
-
-```bash
-python client.py --host 127.0.0.1 --port 5000 --modo-confirmacao seletivo
-```
-
-Deve aparecer ACK individual para cada pacote.
-
-### 9.7. Repeticao seletiva com perda no meio da janela
-
-```bash
-python client.py --host 127.0.0.1 --port 5000 --modo-confirmacao seletivo --drop-seqs 2 --timeout-ack-ms 1500 --max-retransmissoes 5
-```
-
-Deve aparecer:
-
-- lacuna detectada pelo servidor;
-- NACK apenas do pacote faltante;
-- retransmissao apenas do pacote faltante;
-- mensagem reconstruida corretamente.
-
-### 9.8. Repeticao seletiva com perda do ultimo pacote
-
-```bash
-python client.py --host 127.0.0.1 --port 5000 --modo-confirmacao seletivo --drop-seqs 6 --timeout-ack-ms 1500 --max-retransmissoes 5
-```
-
-Esse teste demonstra timeout com retransmissao seletiva apenas dos pendentes.
-
-### 9.9. Envio individual com perda
-
-Use a terceira entrada interativa como `1` para selecionar individual:
-
-```text
-2048
-5
-1
-mensagemindividualconfiavel
-sair
-```
-
-Comando:
-
-```bash
-python client.py --host 127.0.0.1 --port 5000 --modo-confirmacao go_back_n --drop-seqs 1 --timeout-ack-ms 1500 --max-retransmissoes 5
-```
-
-Deve aparecer Stop-and-Wait com timeout/retransmissao e mensagem reconstruida corretamente.
-
-### 9.10. Demonstracao sem criptografia
-
-```bash
-python client.py --host 127.0.0.1 --port 5000 --sem-criptografia --corrupt-checksum-seqs 2 --timeout-ack-ms 1500 --max-retransmissoes 5
-```
-
-Esse roteiro deixa o payload em claro nos logs e facilita visualizar a soma de verificacao.
-
----
-
-## 10. Como cada requisito e atendido
-
-| Requisito | Implementacao |
-|---|---|
-| Conexao via localhost ou IP | `--host` e `--port` no cliente e no servidor; uso de sockets TCP. |
-| Protocolo de aplicacao | JSON por linha, com tipos `handshake`, `handshake_ack`, `dados`, `ack`, `nack`, `fim_sessao` e `encerramento`. |
-| Limite minimo de 30 caracteres | Cliente exige entrada `>= 30`; servidor valida `tamanho_maximo_desejado >= 30`. |
-| Payload maximo de 4 caracteres | Cliente fragmenta com `PAYLOAD_CHUNK_SIZE = 4`; servidor rejeita payload maior que 4. |
-| Soma de verificacao | Campo `checksum` CRC32 em todos os pacotes, validado pelo servidor. |
-| Temporizador | Cliente usa `socket.settimeout()` durante espera de ACK/NACK e retransmite em timeout. |
-| Numero de sequencia | Campo `seq` em cada pacote. |
-| ACK positivo | Servidor envia `tipo: ack`, `status: ok`. |
-| NACK negativo | Servidor envia `tipo: nack`, `status: reenviar`. |
-| Janela/paralelismo | Servidor define `janela_sessao` entre 1 e 5, padrao 5. |
-| Envio individual | Tipo de operacao `individual`, equivalente a Stop-and-Wait. |
-| Envio em lotes | Tipo de operacao `lotes`, usando janela. |
-| Go-Back-N | `--modo-confirmacao go_back_n`, ACK cumulativo e retransmissao da faixa. |
-| Repeticao seletiva | `--modo-confirmacao seletivo`, ACK individual, buffer fora de ordem e retransmissao seletiva. |
-| Simulacao de perda | `--drop-seqs`. |
-| Simulacao de erro de integridade | `--corrupt-seqs` e `--corrupt-checksum-seqs`. |
-| Criptografia simetrica | AES-GCM com chave derivada por HKDF a partir de `PSK` e `session_salt`. |
-| Logs de metadados no servidor | Servidor imprime `seq`, `fim`, tamanho do payload, checksum, criptografia, nonce/HMAC parcial ou payload em claro. |
-| Logs de confirmacoes no cliente | Cliente imprime tipo de controle, `seq`, cumulatividade e mensagem. |
-| Manual de utilizacao | Este README. |
-| Declaracao de uso de IA | Secao 13 deste README. |
-
----
-
-## 11. Observacoes sobre robustez
-
-1. A implementacao evita `socket.makefile().readline()` para que o socket continue utilizavel apos um timeout.
-2. Em Go-Back-N, pacotes duplicados antigos fazem o servidor reenviar o ultimo ACK cumulativo em vez de gerar NACK obsoleto.
-3. Em Go-Back-N, NACKs duplicados para a mesma base sao tratados como controles obsoletos ate a base avancar ou ocorrer timeout; isso evita abortar a janela quando o primeiro pacote da janela sofre perda/corrupcao e os demais pacotes geram varios NACKs iguais.
-4. O cliente ignora ACKs/NACKs antigos ou fora da janela atual.
-5. A corrupcao simulada e deterministica: o primeiro caractere do campo afetado e sempre alterado.
-6. O checksum existe em pacotes criptografados e nao criptografados.
-7. O modo sem criptografia existe para demonstracao didatica do payload e do checksum.
-
----
-
-## 12. Troubleshooting
-
-### Porta em uso
-
-Erro:
-
-```text
-OSError: [Errno 98] Address already in use
-```
-
-Solucao: escolha outra porta ou encerre o servidor antigo.
-
-```bash
-python server.py --host 127.0.0.1 --port 5001
-python client.py --host 127.0.0.1 --port 5001
-```
-
-### Biblioteca cryptography ausente
-
-Erro:
-
-```text
-Biblioteca cryptography nao esta instalada
-```
-
-Solucao:
-
-```bash
-pip install cryptography
-```
-
-Ou rode sem criptografia:
-
-```bash
-python client.py --sem-criptografia
-```
-
-### PSK diferente entre cliente e servidor
-
-Se `PSK` for diferente nos dois terminais, o servidor rejeitara os pacotes criptografados por falha de HMAC ou descriptografia. Configure o mesmo valor nos dois lados.
-
-### Mensagem maior que o limite negociado
-
-Se a mensagem digitada tiver mais caracteres que o limite definido no inicio, o cliente rejeita o envio.
-
----
-
-## 13. Declaracao de uso de IA
-
-Foram utilizados agentes de LLM como apoio para:
-
-- interpretar os requisitos do enunciado;
-- revisar a aderencia entre especificacao e implementacao;
-- identificar falhas em temporizador, Go-Back-N, simulacao de corrupcao e demonstracao de checksum;
-- propor melhorias de arquitetura para leitura por `recv()` em vez de `makefile().readline()`;
-- auxiliar na redacao do manual de utilizacao e do roteiro de testes.
-
-A implementacao final deve ser compreendida, revisada e apresentada pelo grupo. Durante a avaliacao oral, todos os integrantes devem conseguir explicar o protocolo, os campos das mensagens, o funcionamento dos algoritmos de retransmissao e os testes de erro/perda.
+Os testes validam fragmentacao, checksum, validacao de handshake, rejeicao de
+sequencias invalidas, HMAC, corrupcao controlada e construcao de pacotes.
+
+## Testes manuais recomendados
+
+1. fluxo valido com Go-Back-N;
+2. fluxo valido com Repeticao Seletiva;
+3. modo individual;
+4. perda simulada com `--drop-seqs`;
+5. corrupcao simulada com `--corrupt-seqs`;
+6. dois clientes simultaneos;
+7. handshake invalido com tamanho menor que 30;
+8. encerramento com `sair`.
+
+## Limitacoes conhecidas
+
+- O protocolo e academico e nao substitui TLS em ambiente real.
+- A autenticacao depende de PSK compartilhada manualmente.
+- O servidor usa uma thread por cliente; para escala elevada, seria melhor usar
+  pool de threads ou I/O assincrono.
+- O servidor registra payloads no terminal para fins didaticos; em producao,
+  isso deveria ser removido ou protegido.
+
+## Uso de agentes de LLM no projeto
+
+Agentes de LLM foram usados como apoio tecnico e organizacional para revisao de
+requisitos, melhoria da documentacao, estruturacao de testes e identificacao de
+lacunas de robustez. As decisoes finais de implementacao, execucao e validacao
+permanecem sob responsabilidade humana.
+
+## Problemas comuns
+
+- `Connection refused`: inicie o servidor antes do cliente.
+- `PSK nao definida`: configure `PSK` nos dois terminais.
+- `Porta em uso`: altere `--port` ou encerre processo antigo.
+- Cliente e servidor nao negociam: verifique se ambos usam a mesma versao do
+  codigo e a mesma PSK.
