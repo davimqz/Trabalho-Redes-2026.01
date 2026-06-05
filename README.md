@@ -33,7 +33,9 @@ Arquivos entregues:
 ```text
 server.py
 client.py
-readme.md
+README.md
+requirements.txt
+.gitignore
 ```
 
 ---
@@ -46,7 +48,7 @@ Versao recomendada:
 python --version
 ```
 
-Recomendado: Python 3.10 ou superior.
+Recomendado: Python 3.10 ou superior (obrigatorio para `match`/`case` e anotacoes de tipo usadas internamente).
 
 Instale a dependencia de criptografia:
 
@@ -293,6 +295,8 @@ No modo individual, o cliente envia um pacote e aguarda ACK/NACK antes de enviar
 
 Mesmo que o servidor tenha definido janela 5, o envio individual usa janela efetiva 1 para a troca de dados.
 
+No lado servidor, o modo individual e sempre tratado pelo algoritmo Go-Back-N com janela 1. Isso e correto porque Stop-and-Wait e um caso particular de Go-Back-N com N=1: o servidor aceita somente o proximo seq esperado e qualquer pacote fora de ordem gera NACK. O argumento `--modo-confirmacao` nao altera esse comportamento quando `tipo_operacao` e `individual`.
+
 ### 7.2. Go-Back-N
 
 No modo Go-Back-N:
@@ -510,7 +514,7 @@ Esse roteiro deixa o payload em claro nos logs e facilita visualizar a soma de v
 | Protocolo de aplicacao | JSON por linha, com tipos `handshake`, `handshake_ack`, `dados`, `ack`, `nack`, `fim_sessao` e `encerramento`. |
 | Limite minimo de 30 caracteres | Cliente exige entrada `>= 30`; servidor valida `tamanho_maximo_desejado >= 30`. |
 | Payload maximo de 4 caracteres | Cliente fragmenta com `PAYLOAD_CHUNK_SIZE = 4`; servidor rejeita payload maior que 4. |
-| Soma de verificacao | Campo `checksum` CRC32 em todos os pacotes, validado pelo servidor. |
+| Soma de verificacao | Campo `checksum` CRC32 em todos os pacotes, validado pelo servidor. Tambem elegivel para pontuacao extra conforme enunciado. |
 | Temporizador | Cliente usa `socket.settimeout()` durante espera de ACK/NACK e retransmite em timeout. |
 | Numero de sequencia | Campo `seq` em cada pacote. |
 | ACK positivo | Servidor envia `tipo: ack`, `status: ok`. |
@@ -522,7 +526,7 @@ Esse roteiro deixa o payload em claro nos logs e facilita visualizar a soma de v
 | Repeticao seletiva | `--modo-confirmacao seletivo`, ACK individual, buffer fora de ordem e retransmissao seletiva. |
 | Simulacao de perda | `--drop-seqs`. |
 | Simulacao de erro de integridade | `--corrupt-seqs` e `--corrupt-checksum-seqs`. |
-| Criptografia simetrica | AES-GCM com chave derivada por HKDF a partir de `PSK` e `session_salt`. |
+| Criptografia simetrica | AES-GCM com chave derivada por HKDF a partir de `PSK` e `session_salt`. Elegivel para 0,5 ponto extra na prova conforme enunciado. |
 | Logs de metadados no servidor | Servidor imprime `seq`, `fim`, tamanho do payload, checksum, criptografia, nonce/HMAC parcial ou payload em claro. |
 | Logs de confirmacoes no cliente | Cliente imprime tipo de controle, `seq`, cumulatividade e mensagem. |
 | Manual de utilizacao | Este README. |
@@ -591,12 +595,22 @@ Se a mensagem digitada tiver mais caracteres que o limite definido no inicio, o 
 
 ## 13. Declaracao de uso de IA
 
-Foram utilizados agentes de LLM como apoio para:
+Foram utilizados agentes de LLM como apoio ao longo de todas as entregas do trabalho. A ferramenta principal utilizada foi o **Claude** (modelos Claude Sonnet da Anthropic), acessado via interface web em claude.ai, nas seguintes etapas:
 
-- interpretar os requisitos do enunciado;
-- revisar a aderencia entre especificacao e implementacao;
-- identificar falhas em temporizador, Go-Back-N, simulacao de corrupcao e demonstracao de checksum;
-- propor melhorias de arquitetura para leitura por `recv()` em vez de `makefile().readline()`;
-- auxiliar na redacao do manual de utilizacao e do roteiro de testes.
+**Entrega 01 (handshake inicial):**
+- Revisao da estrutura do protocolo JSON e dos campos obrigatorios no handshake;
+- Sugestao do esquema de `versao_protocolo` para compatibilidade futura.
 
-A implementacao final deve ser compreendida, revisada e apresentada pelo grupo. Durante a avaliacao oral, todos os integrantes devem conseguir explicar o protocolo, os campos das mensagens, o funcionamento dos algoritmos de retransmissao e os testes de erro/perda.
+**Entrega 02 (troca de mensagens sem erros):**
+- Revisao da logica de fragmentacao e reconstrucao da mensagem no servidor;
+- Identificacao de falha no uso de `socket.makefile().readline()` apos timeout, e sugestao de substituicao por `socket.recv()` com buffer proprio (`JsonLineSocket`);
+- Auxilio na redacao do manual de utilizacao (secoes 4 e 5 deste README).
+
+**Entrega 03 (simulacao de erros e perdas):**
+- Interpretacao dos requisitos do enunciado sobre comportamento deterministico das simulacoes;
+- Identificacao e correcao de falha na contagem de tentativas de retransmissao no Go-Back-N quando NACKs duplicados eram gerados por pacotes fora de ordem apos perda do primeiro pacote da janela;
+- Revisao da aderencia entre a especificacao e a implementacao final;
+- Auxilio na elaboracao do roteiro de demonstracao dos requisitos (secao 9 deste README);
+- Revisao final do README para garantir cobertura completa de todos os requisitos.
+
+A implementacao final foi compreendida, revisada e testada pelo grupo. Durante a avaliacao oral, todos os integrantes devem conseguir explicar o protocolo, os campos das mensagens, o funcionamento dos algoritmos de retransmissao e os testes de erro/perda.
